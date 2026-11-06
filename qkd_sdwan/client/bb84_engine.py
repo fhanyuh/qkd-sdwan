@@ -7,6 +7,7 @@ import hashlib
 import hmac
 import json
 import math
+import os
 import random
 import secrets
 import socket
@@ -172,6 +173,7 @@ class BB84ProtocolEngine:
         self.auth_secret = bytes(auth_secret)
         self.channel_params = channel_params or QuantumChannelParams()
         self._server_socket: socket.socket | None = None
+        self._responder_thread: threading.Thread | None = None
         self._stop_event = threading.Event()
         self._bound_port: int = 0
 
@@ -357,7 +359,8 @@ class BB84ProtocolEngine:
         alice_bits = [(raw_bits_int >> i) & 1 for i in range(n)]
         alice_bases = [(raw_bases_int >> i) & 1 for i in range(n)]
 
-        with socket.create_connection((peer_host, peer_port), timeout=timeout) as sock:
+        connect_host = "127.0.0.1" if peer_host.strip() in ("0.0.0.0", "::", "") else peer_host.strip()
+        with socket.create_connection((connect_host, peer_port), timeout=timeout) as sock:
             sock.settimeout(timeout)
 
             # Step 1: Send QKD_INIT
@@ -838,12 +841,17 @@ class BB84ProtocolEngine:
         """Start a background TCP server thread that responds to incoming BB84 sessions."""
         self._stop_event.clear()
         srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        srv.bind((host, port))
-        srv.listen(16)
-        srv.settimeout(0.25)
-        self._server_socket = srv
-        self._bound_port = srv.getsockname()[1]
+        try:
+            if os.name != "nt":
+                srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            srv.bind((host, port))
+            srv.listen(16)
+            srv.settimeout(0.25)
+            self._server_socket = srv
+            self._bound_port = srv.getsockname()[1]
+        except Exception:
+            srv.close()
+            raise
 
         def _handle_client(client_sock: socket.socket) -> None:
             with client_sock:
@@ -870,6 +878,7 @@ class BB84ProtocolEngine:
                 client_thread.start()
 
         thread = threading.Thread(target=_serve_loop, name=f"bb84-responder-{self.node_id}", daemon=True)
+        self._responder_thread = thread
         thread.start()
         return thread
 
@@ -882,3 +891,6 @@ class BB84ProtocolEngine:
             except OSError:
                 pass
             self._server_socket = None
+        if self._responder_thread is not None and self._responder_thread.is_alive():
+            self._responder_thread.join(timeout=0.5)
+        self._responder_thread = None

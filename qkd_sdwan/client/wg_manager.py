@@ -124,10 +124,20 @@ class WireGuardTunnelDaemon:
         self.auth_failure_count: int = 0
         self._stop_event = threading.Event()
         self._udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self._udp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self._udp_sock.bind((self.bind_host, self.listen_port))
-        self._udp_sock.settimeout(0.2)
-        self._bound_port = self._udp_sock.getsockname()[1]
+        try:
+            if os.name != "nt":
+                self._udp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self._udp_sock.bind((self.bind_host, self.listen_port))
+            if hasattr(socket, "SIO_UDP_CONNRESET"):
+                try:
+                    self._udp_sock.ioctl(socket.SIO_UDP_CONNRESET, False)
+                except OSError:
+                    pass
+            self._udp_sock.settimeout(0.2)
+            self._bound_port = self._udp_sock.getsockname()[1]
+        except Exception:
+            self._udp_sock.close()
+            raise
         self.listen_port = self._bound_port
 
         self._listener_thread = threading.Thread(
@@ -169,7 +179,9 @@ class WireGuardTunnelDaemon:
     @staticmethod
     def _parse_endpoint(endpoint: str) -> tuple[str, int]:
         host, port_str = endpoint.rsplit(":", 1)
-        return host, int(port_str)
+        clean_host = host.strip()
+        norm_host = "127.0.0.1" if clean_host in ("0.0.0.0", "::", "") else clean_host
+        return norm_host, int(port_str)
 
     def _derive_session_aead_key(self, peer_public_key_b64: str, raw_psk_32bytes: bytes) -> bytes:
         peer_pub_raw = base64.b64decode(peer_public_key_b64.encode("ascii"))
@@ -408,7 +420,7 @@ class WireGuardTunnelDaemon:
         while not self._stop_event.is_set():
             try:
                 datagram, sender_addr = self._udp_sock.recvfrom(65535)
-            except socket.timeout:
+            except (socket.timeout, TimeoutError, ConnectionResetError):
                 continue
             except OSError:
                 break
@@ -594,3 +606,5 @@ class WireGuardTunnelDaemon:
             self._udp_sock.close()
         except OSError:
             pass
+        if self._listener_thread.is_alive():
+            self._listener_thread.join(timeout=0.5)

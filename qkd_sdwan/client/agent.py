@@ -6,6 +6,7 @@ import argparse
 import base64
 from datetime import datetime, timezone
 import json
+import os
 from pathlib import Path
 import secrets
 import threading
@@ -151,11 +152,15 @@ class SDWANEndpointAgent:
             auth_secret=auth_secret,
             channel_params=channel_params,
         )
-        self.bb84_engine.start_tcp_responder(
-            host=underlay_host,
-            port=qkd_port,
-            on_key_established=self._on_responder_bb84_completed,
-        )
+        try:
+            self.bb84_engine.start_tcp_responder(
+                host=underlay_host,
+                port=qkd_port,
+                on_key_established=self._on_responder_bb84_completed,
+            )
+        except Exception:
+            self.wg_daemon.close()
+            raise
         self.qkd_port = self.bb84_engine.bound_port
     @classmethod
     def enroll_with_controller(
@@ -870,15 +875,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--config",
         type=str,
-        default="/etc/qkd-sdwan/endpoint.json",
+        default=None,
         help="Path to endpoint JSON configuration file (default: /etc/qkd-sdwan/endpoint.json)",
     )
     parser.add_argument("--node-id", type=str, help="Override endpoint node ID")
     parser.add_argument("--overlay-ip", type=str, help="Override WireGuard overlay IPv4 address")
     parser.add_argument("--controller-url", type=str, help="Override Central Controller base URL")
     parser.add_argument("--join-token", type=str, help="Optional Join Token for automatic controller enrollment")
-    parser.add_argument("--wg-port", type=int, default=0, help="WireGuard UDP listen port")
-    parser.add_argument("--qkd-port", type=int, default=0, help="BB84 QKD TCP listen port")
+    parser.add_argument("--wg-port", type=int, default=None, help="WireGuard UDP listen port")
+    parser.add_argument("--qkd-port", type=int, default=None, help="BB84 QKD TCP listen port")
     parser.add_argument(
         "--prefer-kernel-wg",
         action="store_true",
@@ -897,6 +902,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     subparsers = parser.add_subparsers(dest="subcommand")
 
+    # subcommand: init-config
+    init_p = subparsers.add_parser("init-config", help="Generate endpoint.json configuration, WireGuard keypair, and optional Join-Token enrollment")
+    init_p.add_argument("--output", type=Path, required=True, help="Output path for endpoint.json")
+    init_p.add_argument("--node-id", type=str, default="edge-node-01", help="Endpoint node ID (default: edge-node-01)")
+    init_p.add_argument("--overlay-ip", type=str, default="10.200.0.10", help="Overlay IPv4 address (default: 10.200.0.10)")
+    init_p.add_argument("--controller-url", type=str, default="http://127.0.0.1:8080", help="Central Controller base URL")
+    init_p.add_argument("--join-token", type=str, default="", help="Optional Join Token for automatic enrollment")
+    init_p.add_argument("--wg-port", type=int, default=51820, help="WireGuard UDP listen port (default: 51820)")
+    init_p.add_argument("--qkd-port", type=int, default=52820, help="BB84 QKD TCP listen port (default: 52820)")
+    init_p.add_argument("--interface", type=str, default="wg-qkd0", help="WireGuard interface name (default: wg-qkd0)")
+    init_p.add_argument("--backend-mode", type=str, default="USERSPACE_CRYPTO_WG", help="WireGuard backend mode")
+    init_p.add_argument("--explicit-ip", action="store_true", help="Request the explicit --overlay-ip during Join-Token enrollment")
+
     # subcommand: enroll
     enroll_p = subparsers.add_parser("enroll", help="Enroll this client node with the Central Controller using a Join Token")
     enroll_p.add_argument("--controller-url", default="http://127.0.0.1:8080", help="Central Controller base URL")
@@ -910,55 +928,121 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     # subcommand: send
     send_p = subparsers.add_parser("send", help="Send an encrypted P2P text message or file to another Client")
-    send_p.add_argument("--config", type=str, default="/etc/qkd-sdwan/endpoint.json", help="Path to endpoint.json")
-    send_p.add_argument("--controller-url", type=str, default=None, help="Override Controller URL")
-    send_p.add_argument("--node-id", type=str, default=None, help="Override source node ID")
-    send_p.add_argument("--overlay-ip", type=str, default=None, help="Override source overlay IP")
+    send_p.add_argument("--config", type=str, default=argparse.SUPPRESS, help="Path to endpoint.json")
+    send_p.add_argument("--controller-url", type=str, default=argparse.SUPPRESS, help="Override Controller URL")
+    send_p.add_argument("--node-id", type=str, default=argparse.SUPPRESS, help="Override source node ID")
+    send_p.add_argument("--overlay-ip", type=str, default=argparse.SUPPRESS, help="Override source overlay IP")
     send_p.add_argument("--to", required=True, dest="target_node", help="Target peer node ID")
     send_p.add_argument("--text", type=str, default=None, help="UTF-8 text message to send")
     send_p.add_argument("--file", type=Path, default=None, help="Path to file to send")
 
     # subcommand: dashboard
     dash_p = subparsers.add_parser("dashboard", help="Display the 4-panel Client CLI Dashboard (snapshot, live watch, or interactive)")
-    dash_p.add_argument("--config", type=str, default="/etc/qkd-sdwan/endpoint.json", help="Path to endpoint.json")
-    dash_p.add_argument("--controller-url", type=str, default=None, help="Override Controller URL")
-    dash_p.add_argument("--node-id", type=str, default=None, help="Override node ID")
-    dash_p.add_argument("--overlay-ip", type=str, default=None, help="Override overlay IP")
-    dash_p.add_argument("--join-token", type=str, default=None, help="Optional Join Token to auto-enroll on startup")
-    dash_p.add_argument("--wg-port", type=int, default=0, help="WireGuard UDP port")
-    dash_p.add_argument("--qkd-port", type=int, default=0, help="BB84 QKD TCP port")
+    dash_p.add_argument("--config", type=str, default=argparse.SUPPRESS, help="Path to endpoint.json")
+    dash_p.add_argument("--controller-url", type=str, default=argparse.SUPPRESS, help="Override Controller URL")
+    dash_p.add_argument("--node-id", type=str, default=argparse.SUPPRESS, help="Override node ID")
+    dash_p.add_argument("--overlay-ip", type=str, default=argparse.SUPPRESS, help="Override overlay IP")
+    dash_p.add_argument("--join-token", type=str, default=argparse.SUPPRESS, help="Optional Join Token to auto-enroll on startup")
+    dash_p.add_argument("--wg-port", type=int, default=argparse.SUPPRESS, help="WireGuard UDP port")
+    dash_p.add_argument("--qkd-port", type=int, default=argparse.SUPPRESS, help="BB84 QKD TCP port")
     dash_p.add_argument("--once", action="store_true", help="Print a single 4-panel Client Dashboard snapshot and exit")
     dash_p.add_argument("--interval", type=float, default=0.0, help="Auto-refresh interval in seconds (0 = interactive menu)")
 
     # subcommand: console
     con_p = subparsers.add_parser("console", help="Start interactive P2P Client console for live messaging and BB84 rekeying")
-    con_p.add_argument("--config", type=str, default="/etc/qkd-sdwan/endpoint.json", help="Path to endpoint.json")
-    con_p.add_argument("--controller-url", type=str, default=None, help="Override Controller URL")
-    con_p.add_argument("--node-id", type=str, default=None, help="Override node ID")
-    con_p.add_argument("--overlay-ip", type=str, default=None, help="Override overlay IP")
-    con_p.add_argument("--join-token", type=str, default=None, help="Optional Join Token to auto-enroll on startup")
-    con_p.add_argument("--wg-port", type=int, default=0, help="WireGuard UDP port")
-    con_p.add_argument("--qkd-port", type=int, default=0, help="BB84 QKD TCP port")
+    con_p.add_argument("--config", type=str, default=argparse.SUPPRESS, help="Path to endpoint.json")
+    con_p.add_argument("--controller-url", type=str, default=argparse.SUPPRESS, help="Override Controller URL")
+    con_p.add_argument("--node-id", type=str, default=argparse.SUPPRESS, help="Override node ID")
+    con_p.add_argument("--overlay-ip", type=str, default=argparse.SUPPRESS, help="Override overlay IP")
+    con_p.add_argument("--join-token", type=str, default=argparse.SUPPRESS, help="Optional Join Token to auto-enroll on startup")
+    con_p.add_argument("--wg-port", type=int, default=argparse.SUPPRESS, help="WireGuard UDP port")
+    con_p.add_argument("--qkd-port", type=int, default=argparse.SUPPRESS, help="BB84 QKD TCP port")
 
     # subcommand: status
     stat_p = subparsers.add_parser("status", help="Show local client identity, peers, and active routing directives")
-    stat_p.add_argument("--config", type=str, default="/etc/qkd-sdwan/endpoint.json", help="Path to endpoint.json")
-    stat_p.add_argument("--controller-url", type=str, default=None, help="Override Controller URL")
-    stat_p.add_argument("--node-id", type=str, default=None, help="Override node ID")
-    stat_p.add_argument("--overlay-ip", type=str, default=None, help="Override overlay IP")
+    stat_p.add_argument("--config", type=str, default=argparse.SUPPRESS, help="Path to endpoint.json")
+    stat_p.add_argument("--controller-url", type=str, default=argparse.SUPPRESS, help="Override Controller URL")
+    stat_p.add_argument("--node-id", type=str, default=argparse.SUPPRESS, help="Override node ID")
+    stat_p.add_argument("--overlay-ip", type=str, default=argparse.SUPPRESS, help="Override overlay IP")
     stat_p.add_argument("--json", action="store_true", help="Output raw JSON status")
-
     return parser
 
 
 def _load_endpoint_config(args: argparse.Namespace) -> dict[str, Any]:
     cfg: dict[str, Any] = {}
-    config_str = getattr(args, "config", "/etc/qkd-sdwan/endpoint.json")
+    config_str = getattr(args, "config", None) or os.environ.get("QKD_SDWAN_CLIENT_CONFIG") or "/etc/qkd-sdwan/endpoint.json"
     if config_str:
         cfg_path = Path(config_str)
         if cfg_path.is_file():
             cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
     return cfg
+
+
+def _run_init_config(args: argparse.Namespace) -> int:
+    out_path = Path(args.output)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    priv, pub = generate_wg_keypair()
+    join_token = (getattr(args, "join_token", "") or "").strip()
+    ctrl_url = str(getattr(args, "controller_url", None) or "http://127.0.0.1:8080").rstrip("/")
+    node_id = str(getattr(args, "node_id", None) or "edge-node-01")
+    overlay_ip = str(getattr(args, "overlay_ip", None) or "10.200.0.10")
+    wg_port = int(getattr(args, "wg_port", None) or 51820)
+    qkd_port = int(getattr(args, "qkd_port", None) or 52820)
+    interface_name = str(getattr(args, "interface", None) or "wg-qkd0")
+    backend_mode = str(getattr(args, "backend_mode", None) or "USERSPACE_CRYPTO_WG")
+    explicit_ip = bool(getattr(args, "explicit_ip", False))
+
+    hmac_secret = secrets.token_hex(32)
+    auth_token_id = "hmac-sha256-cluster-v1"
+    enrolled_token_id: str | None = None
+
+    if join_token:
+        try:
+            req_data = {
+                "join_token": join_token,
+                "node_id": node_id,
+                "underlay_host": "127.0.0.1",
+                "wg_port": wg_port,
+                "qkd_port": qkd_port,
+                "wg_public_key": pub,
+                "overlay_ip": overlay_ip if explicit_ip else None,
+            }
+            body = json.dumps(req_data).encode("utf-8")
+            req = request.Request(
+                f"{ctrl_url}/api/v1/nodes/enroll",
+                data=body,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with request.urlopen(req, timeout=3.0) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+                overlay_ip = str(data.get("allocated_overlay_ip", overlay_ip))
+                hmac_secret = str(data.get("cluster_hmac_secret_hex", hmac_secret))
+                auth_token_id = str(data.get("auth_token_id", f"enrolled-{data.get('token_id', 'tok')}"))
+                enrolled_token_id = data.get("token_id")
+                print(f"      [+] Successfully enrolled {node_id} via Join Token (allocated IP: {overlay_ip})")
+        except Exception as exc:
+            print(f"      [!] Controller enrollment skipped ({exc}); configuring standalone keys")
+
+    cfg = {
+        "node_id": node_id,
+        "overlay_ip": overlay_ip,
+        "interface_name": interface_name,
+        "controller_url": ctrl_url,
+        "wg_port": wg_port,
+        "qkd_port": qkd_port,
+        "wg_backend_mode": backend_mode,
+        "wg_private_key": priv,
+        "wg_public_key": pub,
+        "classical_hmac_secret_hex": hmac_secret,
+        "cluster_hmac_secret_hex": hmac_secret,
+        "auth_token_id": auth_token_id,
+        "enrolled_token_id": enrolled_token_id,
+        "qber_abort_threshold": 0.11,
+        "generated_at": time.time(),
+    }
+    out_path.write_text(json.dumps(cfg, indent=2) + "\n", encoding="utf-8")
+    return 0
 
 
 def _build_agent_from_args(args: argparse.Namespace) -> SDWANEndpointAgent:
@@ -967,8 +1051,10 @@ def _build_agent_from_args(args: argparse.Namespace) -> SDWANEndpointAgent:
     overlay_ip = getattr(args, "overlay_ip", None) or cfg.get("overlay_ip", "10.200.0.10")
     controller_url = getattr(args, "controller_url", None) or cfg.get("controller_url", "http://127.0.0.1:8080")
     underlay_host = cfg.get("underlay_host", "127.0.0.1")
-    wg_port = getattr(args, "wg_port", 0) or int(cfg.get("wg_port", 0))
-    qkd_port = getattr(args, "qkd_port", 0) or int(cfg.get("qkd_port", 0))
+    raw_wg_port = getattr(args, "wg_port", None)
+    wg_port = int(raw_wg_port) if raw_wg_port is not None else int(cfg.get("wg_port", 0))
+    raw_qkd_port = getattr(args, "qkd_port", None)
+    qkd_port = int(raw_qkd_port) if raw_qkd_port is not None else int(cfg.get("qkd_port", 0))
     secret_hex = cfg.get("cluster_hmac_secret_hex")
     auth_secret = bytes.fromhex(secret_hex) if secret_hex else b"qkd-sdwan-default-hmac-secret"
 
@@ -1113,6 +1199,9 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_arg_parser()
     args = parser.parse_args(argv)
     sub = getattr(args, "subcommand", None)
+
+    if sub == "init-config":
+        return _run_init_config(args)
 
     if sub == "enroll":
         agent, enroll_resp = SDWANEndpointAgent.enroll_with_controller(

@@ -5,7 +5,9 @@ from __future__ import annotations
 import argparse
 from datetime import datetime, timezone
 import json
+import os
 from pathlib import Path
+import secrets
 import time
 from typing import Any
 import urllib.error
@@ -227,41 +229,56 @@ def build_controller_parser() -> argparse.ArgumentParser:
 
     # subcommand: serve
     serve_p = subparsers.add_parser("serve", help="Start the Central Controller HTTP server")
-    serve_p.add_argument("--config", type=Path, help="Path to JSON controller configuration file")
-    serve_p.add_argument("--host", default=None, help="Bind IP address (default: 127.0.0.1)")
-    serve_p.add_argument("--port", type=int, default=None, help="Bind HTTP port (default: 8080)")
-    serve_p.add_argument("--subnet-prefix", default=None, help="Overlay IPv4 /24 prefix (default: 10.200.0.)")
-    serve_p.add_argument("--bootstrap-token", default=None, help="Custom initial Join Token string")
-    serve_p.add_argument("--dashboard", action="store_true", help="Run interactive CLI dashboard console")
-    serve_p.add_argument("--check-config", action="store_true", help="Validate configuration and exit")
+    serve_p.add_argument("--config", type=Path, default=argparse.SUPPRESS, help="Path to JSON controller configuration file")
+    serve_p.add_argument("--host", default=argparse.SUPPRESS, help="Bind IP address (default: 127.0.0.1)")
+    serve_p.add_argument("--port", type=int, default=argparse.SUPPRESS, help="Bind HTTP port (default: 8080)")
+    serve_p.add_argument("--subnet-prefix", default=argparse.SUPPRESS, help="Overlay IPv4 /24 prefix (default: 10.200.0.)")
+    serve_p.add_argument("--bootstrap-token", default=argparse.SUPPRESS, help="Custom initial Join Token string")
+    serve_p.add_argument("--dashboard", action="store_true", default=argparse.SUPPRESS, help="Run interactive CLI dashboard console")
+    serve_p.add_argument("--check-config", action="store_true", default=argparse.SUPPRESS, help="Validate configuration and exit")
+
+    # subcommand: init-config
+    init_p = subparsers.add_parser("init-config", help="Generate initial controller.json configuration and bootstrap Join Token")
+    init_p.add_argument("--output", type=Path, required=True, help="Output path for controller.json")
+    init_p.add_argument("--host", default="0.0.0.0", help="Bind IP address (default: 0.0.0.0)")
+    init_p.add_argument("--port", type=int, default=8080, help="Bind HTTP port (default: 8080)")
+    init_p.add_argument("--subnet-prefix", default="10.200.0.", help="Overlay IPv4 /24 prefix (default: 10.200.0.)")
+    init_p.add_argument("--bootstrap-token", default="", help="Optional custom bootstrap Join Token")
 
     # subcommand: dashboard
     dash_p = subparsers.add_parser("dashboard", help="Display the Controller CLI Dashboard")
-    dash_p.add_argument("--controller-url", default="http://127.0.0.1:8080", help="Controller base URL")
+    dash_p.add_argument("--config", type=Path, default=argparse.SUPPRESS, help="Path to JSON controller configuration file")
+    dash_p.add_argument("--controller-url", default=None, help="Controller base URL")
     dash_p.add_argument("--once", action="store_true", help="Print a single dashboard snapshot and exit")
     dash_p.add_argument("--interval", type=float, default=2.0, help="Refresh interval in seconds (default: 2.0)")
 
     # subcommand: token
     tok_p = subparsers.add_parser("token", help="Manage client enrollment Join Tokens")
+    tok_p.add_argument("--config", type=Path, default=argparse.SUPPRESS, help="Path to JSON controller configuration file")
+    tok_p.add_argument("--controller-url", default=None, help="Controller base URL")
     tok_sub = tok_p.add_subparsers(dest="token_action")
 
     tok_create = tok_sub.add_parser("create", help="Create a new enrollment Join Token")
-    tok_create.add_argument("--controller-url", default="http://127.0.0.1:8080", help="Controller base URL")
+    tok_create.add_argument("--config", type=Path, default=argparse.SUPPRESS, help="Path to JSON controller configuration file")
+    tok_create.add_argument("--controller-url", default=None, help="Controller base URL")
     tok_create.add_argument("--label", default="cli-token", help="Descriptive token label")
     tok_create.add_argument("--max-uses", type=int, default=10, help="Maximum node enrollments allowed")
     tok_create.add_argument("--ttl", type=float, default=86400.0, help="Token validity TTL in seconds")
     tok_create.add_argument("--custom-token", default=None, help="Optional custom token secret string")
 
     tok_list = tok_sub.add_parser("list", help="List all enrollment Join Tokens")
-    tok_list.add_argument("--controller-url", default="http://127.0.0.1:8080", help="Controller base URL")
+    tok_list.add_argument("--config", type=Path, default=argparse.SUPPRESS, help="Path to JSON controller configuration file")
+    tok_list.add_argument("--controller-url", default=None, help="Controller base URL")
 
     tok_revoke = tok_sub.add_parser("revoke", help="Revoke an enrollment Join Token by ID")
-    tok_revoke.add_argument("--controller-url", default="http://127.0.0.1:8080", help="Controller base URL")
+    tok_revoke.add_argument("--config", type=Path, default=argparse.SUPPRESS, help="Path to JSON controller configuration file")
+    tok_revoke.add_argument("--controller-url", default=None, help="Controller base URL")
     tok_revoke.add_argument("--token-id", required=True, help="Token ID to revoke (e.g. tok-a1b2c3d4)")
 
     # subcommand: status
     stat_p = subparsers.add_parser("status", help="Query cluster status from a running Controller")
-    stat_p.add_argument("--controller-url", default="http://127.0.0.1:8080", help="Controller base URL")
+    stat_p.add_argument("--config", type=Path, default=argparse.SUPPRESS, help="Path to JSON controller configuration file")
+    stat_p.add_argument("--controller-url", default=None, help="Controller base URL")
     stat_p.add_argument("--json", action="store_true", help="Output raw JSON cluster status")
 
     return parser
@@ -276,6 +293,10 @@ def _load_controller_config(args: argparse.Namespace) -> dict[str, Any]:
         "bootstrap_join_token": None,
     }
     config_path: Path | None = getattr(args, "config", None)
+    if config_path is None:
+        env_cfg = os.environ.get("QKD_SDWAN_CONTROLLER_CONFIG")
+        if env_cfg:
+            config_path = Path(env_cfg)
     if config_path and config_path.exists():
         loaded = json.loads(config_path.read_text(encoding="utf-8"))
         if isinstance(loaded, dict):
@@ -291,6 +312,34 @@ def _load_controller_config(args: argparse.Namespace) -> dict[str, Any]:
         cfg["bootstrap_join_token"] = args.bootstrap_token
 
     return cfg
+
+
+def _resolve_controller_url(args: argparse.Namespace) -> str:
+    explicit_url = getattr(args, "controller_url", None)
+    if explicit_url:
+        return str(explicit_url)
+    cfg = _load_controller_config(args)
+    raw_host = str(cfg.get("host", "127.0.0.1")).strip()
+    host = "127.0.0.1" if raw_host in ("0.0.0.0", "::", "") else raw_host
+    return f"http://{host}:{int(cfg.get('port', 8080))}"
+
+
+def _run_init_config(args: argparse.Namespace) -> int:
+    out_path: Path = Path(args.output)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    token = (getattr(args, "bootstrap_token", "") or "").strip() or f"qkd-join-{secrets.token_hex(12)}"
+    secret_hex = secrets.token_hex(32)
+    cfg = {
+        "host": str(getattr(args, "host", None) or "0.0.0.0"),
+        "port": int(getattr(args, "port", None) or 8080),
+        "overlay_subnet_prefix": str(getattr(args, "subnet_prefix", None) or "10.200.0."),
+        "cluster_hmac_secret_hex": secret_hex,
+        "bootstrap_join_token": token,
+        "generated_at": time.time(),
+    }
+    out_path.write_text(json.dumps(cfg, indent=2) + "\n", encoding="utf-8")
+    print(token)
+    return 0
 
 
 def _run_serve(args: argparse.Namespace) -> int:
@@ -362,7 +411,7 @@ def _run_serve(args: argparse.Namespace) -> int:
 
 
 def _run_dashboard(args: argparse.Namespace) -> int:
-    url = args.controller_url.rstrip("/")
+    url = _resolve_controller_url(args).rstrip("/")
     if args.once:
         status = _http_json(f"{url}/api/v1/cluster/status")
         print(render_controller_dashboard(status, controller_url=url))
@@ -381,7 +430,7 @@ def _run_dashboard(args: argparse.Namespace) -> int:
 
 def _run_token(args: argparse.Namespace) -> int:
     action = getattr(args, "token_action", None) or "list"
-    url = getattr(args, "controller_url", "http://127.0.0.1:8080").rstrip("/")
+    url = _resolve_controller_url(args).rstrip("/")
 
     if action == "create":
         resp = _http_json(
@@ -427,7 +476,7 @@ def _run_token(args: argparse.Namespace) -> int:
 
 
 def _run_status(args: argparse.Namespace) -> int:
-    url = args.controller_url.rstrip("/")
+    url = _resolve_controller_url(args).rstrip("/")
     status = _http_json(f"{url}/api/v1/cluster/status")
     if getattr(args, "json", False):
         print(json.dumps(status, indent=2))
@@ -443,6 +492,8 @@ def main(argv: list[str] | None = None) -> int:
 
     if sub in (None, "serve"):
         return _run_serve(args)
+    if sub == "init-config":
+        return _run_init_config(args)
     if sub == "dashboard":
         return _run_dashboard(args)
     if sub == "token":

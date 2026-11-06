@@ -100,6 +100,12 @@ if ! command -v python3 >/dev/null 2>&1; then
 fi
 PYTHON_BIN="$(command -v python3)"
 echo "      Python runtime : ${PYTHON_BIN}"
+if ! "${PYTHON_BIN}" -c "import cryptography" >/dev/null 2>&1; then
+  echo "      Installing required Python package 'cryptography'..."
+  "${PYTHON_BIN}" -m pip install --disable-pip-version-check --user cryptography || \
+    "${PYTHON_BIN}" -m pip install --disable-pip-version-check --break-system-packages cryptography || \
+    "${PYTHON_BIN}" -m pip install --disable-pip-version-check cryptography
+fi
 
 echo "[2/4] Preparing controller directories under ${PREFIX}..."
 mkdir -p "${PREFIX}/bin" "${PREFIX}/etc" "${PREFIX}/lib"
@@ -121,23 +127,14 @@ if [[ -n "${PYZ_SRC}" && -f "${PYZ_SRC}" ]]; then
 fi
 
 echo "[3/4] Generating cluster HMAC secret, bootstrap Join Token, and controller.json..."
+export PYTHONPATH="${PYZ_DEST}:${REPO_ROOT}:${PYTHONPATH:-}"
 CONFIG_PATH="${PREFIX}/etc/controller.json"
-TOKEN_INFO="$("${PYTHON_BIN}" -c "
-import json, secrets, time
-token = '${BOOTSTRAP_TOKEN}'.strip() or ('qkd-join-' + secrets.token_hex(12))
-secret_hex = secrets.token_hex(32)
-cfg = {
-    'host': '${HOST}',
-    'port': int('${PORT}'),
-    'overlay_subnet_prefix': '${SUBNET_PREFIX}',
-    'cluster_hmac_secret_hex': secret_hex,
-    'bootstrap_join_token': token,
-    'generated_at': time.time(),
-}
-with open('${CONFIG_PATH}', 'w', encoding='utf-8') as f:
-    json.dump(cfg, f, indent=2)
-print(token)
-")"
+TOKEN_INFO="$("${PYTHON_BIN}" -m qkd_sdwan.controller.cli init-config \
+  --output "${CONFIG_PATH}" \
+  --host "${HOST}" \
+  --port "${PORT}" \
+  --subnet-prefix "${SUBNET_PREFIX}" \
+  --bootstrap-token "${BOOTSTRAP_TOKEN}")"
 chmod 600 "${CONFIG_PATH}"
 
 echo "[4/4] Installing CLI wrappers (qkd-sdwan-controller, qkd-sdwan-ctl) and systemd service..."
@@ -146,6 +143,7 @@ cat > "${CONTROLLER_BIN}" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
 export PYTHONPATH="${PYZ_DEST}:${REPO_ROOT}:\${PYTHONPATH:-}"
+export QKD_SDWAN_CONTROLLER_CONFIG="${CONFIG_PATH}"
 exec "${PYTHON_BIN}" -m qkd_sdwan.controller.cli --config "${CONFIG_PATH}" "\$@"
 EOF
 chmod +x "${CONTROLLER_BIN}"
@@ -155,6 +153,7 @@ cat > "${CTL_BIN}" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
 export PYTHONPATH="${PYZ_DEST}:${REPO_ROOT}:\${PYTHONPATH:-}"
+export QKD_SDWAN_CONTROLLER_CONFIG="${CONFIG_PATH}"
 exec "${PYTHON_BIN}" -m qkd_sdwan.controller.cli --config "${CONFIG_PATH}" "\$@"
 EOF
 chmod +x "${CTL_BIN}"

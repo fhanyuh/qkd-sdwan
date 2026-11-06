@@ -9,7 +9,7 @@ token manager, and Windows scheduled task launcher).
 
 [CmdletBinding()]
 param(
-    [string]$Prefix = "$env:ProgramData\qkd-sdwan-controller",
+    [string]$Prefix = "",
     [string]$BindHost = "0.0.0.0",
     [int]$Port = 8080,
     [string]$SubnetPrefix = "10.200.0.",
@@ -19,7 +19,31 @@ param(
 
 $ErrorActionPreference = "Stop"
 
-if (-not $NonInteractive -and [Environment]::UserInteractive) {
+$IsAdmin = $false
+try {
+    $CurrentPrincipal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
+    $IsAdmin = $CurrentPrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+} catch {
+    $IsAdmin = $false
+}
+
+if (-not $PSBoundParameters.ContainsKey("Prefix") -or [string]::IsNullOrWhiteSpace($Prefix)) {
+    if ($IsAdmin) {
+        $Prefix = "$env:ProgramData\qkd-sdwan-controller"
+    } else {
+        $Prefix = "$env:LOCALAPPDATA\qkd-sdwan-controller"
+    }
+}
+
+$HasExplicitConfigFlags = (
+    $PSBoundParameters.ContainsKey("Prefix") -or
+    $PSBoundParameters.ContainsKey("BindHost") -or
+    $PSBoundParameters.ContainsKey("Port") -or
+    $PSBoundParameters.ContainsKey("SubnetPrefix") -or
+    $PSBoundParameters.ContainsKey("BootstrapToken")
+)
+
+if (-not $NonInteractive -and -not $HasExplicitConfigFlags -and [Environment]::UserInteractive) {
     Write-Host "================================================================================" -ForegroundColor Cyan
     Write-Host " QKD-SDWAN Central Controller — Interactive Windows CLI Installer Wizard" -ForegroundColor Cyan
     Write-Host "================================================================================" -ForegroundColor Cyan
@@ -36,18 +60,79 @@ if (-not $NonInteractive -and [Environment]::UserInteractive) {
     Write-Host "--------------------------------------------------------------------------------" -ForegroundColor Cyan
 }
 
+function Resolve-PythonExe {
+    $PrevErr = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try {
+        $ProbeCode = "import sys; assert sys.version_info >= (3, 11); print(sys.executable)"
+        $Candidates = @(
+            @{ Exe = "python"; Args = @("-c", $ProbeCode) },
+            @{ Exe = "py"; Args = @("-3", "-c", $ProbeCode) },
+            @{ Exe = "python3"; Args = @("-c", $ProbeCode) }
+        )
+        foreach ($cand in $Candidates) {
+            $cmd = Get-Command $cand.Exe -ErrorAction SilentlyContinue
+            if ($cmd) {
+                $out = & $cand.Exe @($cand.Args) 2>$null
+                if ($LASTEXITCODE -eq 0 -and $out) {
+                    $exePath = ($out | Select-Object -Last 1).ToString().Trim()
+                    if ((Test-Path $exePath) -and ($exePath -notlike "*WindowsApps*")) {
+                        return $exePath
+                    }
+                }
+            }
+        }
+        $FallbackGlobs = @(
+            "$env:LOCALAPPDATA\Programs\Python\Python3*\python.exe",
+            "$env:ProgramFiles\Python3*\python.exe"
+        )
+        foreach ($glob in $FallbackGlobs) {
+            $found = Get-Item $glob -ErrorAction SilentlyContinue | Sort-Object FullName -Descending | Select-Object -First 1
+            if ($found) {
+                $out = & $found.FullName -c $ProbeCode 2>$null
+                if ($LASTEXITCODE -eq 0 -and $out) {
+                    return $found.FullName
+                }
+            }
+        }
+    } finally {
+        $ErrorActionPreference = $PrevErr
+    }
+    return $null
+}
+
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $RepoRoot = Split-Path -Parent $ScriptDir
 
-Write-Host "[1/4] Checking Python runtime on Windows..." -ForegroundColor Yellow
-$PythonCmd = "python"
-if (Get-Command py -ErrorAction SilentlyContinue) {
-    $PythonCmd = "py -3"
-} elseif (-not (Get-Command python -ErrorAction SilentlyContinue)) {
-    Write-Error "Python 3 is required but not found in PATH."
+Write-Host "[1/4] Checking Python runtime and cryptography dependency on Windows..." -ForegroundColor Yellow
+$PythonExe = Resolve-PythonExe
+if (-not $PythonExe) {
+    Write-Error "Python 3.11+ is required but was not found in PATH (or only the Microsoft Store stub is present)."
     exit 1
 }
-Write-Host "      Python Command: $PythonCmd"
+Write-Host "      Python Executable: $PythonExe"
+
+$PrevErr = $ErrorActionPreference
+$ErrorActionPreference = "Continue"
+& $PythonExe -c "import cryptography" 2>$null
+$CryptoCheck = $LASTEXITCODE
+$ErrorActionPreference = $PrevErr
+
+if ($CryptoCheck -ne 0) {
+    Write-Host "      Installing required Python package 'cryptography'..." -ForegroundColor Yellow
+    $ErrorActionPreference = "Continue"
+    & $PythonExe -m pip install --disable-pip-version-check cryptography
+    if ($LASTEXITCODE -ne 0) {
+        & $PythonExe -m pip install --disable-pip-version-check --user cryptography
+    }
+    & $PythonExe -c "import cryptography" 2>$null
+    $VerifyCrypto = $LASTEXITCODE
+    $ErrorActionPreference = "Stop"
+    if ($VerifyCrypto -ne 0) {
+        Write-Error "Failed to install or import required Python package 'cryptography'."
+        exit 1
+    }
+}
 
 Write-Host "[2/4] Preparing directories under $Prefix..." -ForegroundColor Yellow
 New-Item -ItemType Directory -Force -Path "$Prefix\bin", "$Prefix\etc", "$Prefix\lib" | Out-Null
@@ -58,7 +143,7 @@ if (Test-Path "$ScriptDir\qkd-sdwan-controller.pyz") {
 } elseif (Test-Path "$RepoRoot\dist\qkd-sdwan-controller.pyz") {
     $PyzSrc = "$RepoRoot\dist\qkd-sdwan-controller.pyz"
 } elseif (Test-Path "$RepoRoot\scripts\build_installers.py") {
-    & python "$RepoRoot\scripts\build_installers.py" | Out-Null
+    & $PythonExe "$RepoRoot\scripts\build_installers.py" | Out-Null
     $PyzSrc = "$RepoRoot\dist\qkd-sdwan-controller.pyz"
 }
 
@@ -69,47 +154,55 @@ if ($PyzSrc -and (Test-Path $PyzSrc)) {
 
 Write-Host "[3/4] Generating cluster HMAC secret, bootstrap Join Token, and controller.json..." -ForegroundColor Yellow
 $ConfigPath = "$Prefix\etc\controller.json"
-$TokenCode = @"
-import json, secrets, time
-token = '$BootstrapToken'.strip() or ('qkd-join-' + secrets.token_hex(12))
-secret_hex = secrets.token_hex(32)
-cfg = {
-    'host': '$BindHost',
-    'port': int('$Port'),
-    'overlay_subnet_prefix': '$SubnetPrefix',
-    'cluster_hmac_secret_hex': secret_hex,
-    'bootstrap_join_token': token,
-    'generated_at': time.time(),
+$env:PYTHONPATH = "$PyzDest;$RepoRoot;$env:PYTHONPATH"
+
+if (Test-Path $PyzDest) {
+    $BootstrapTokenActual = (& $PythonExe $PyzDest init-config --output "$ConfigPath" --host "$BindHost" --port "$Port" --subnet-prefix "$SubnetPrefix" --bootstrap-token "$BootstrapToken" | Select-Object -Last 1).ToString().Trim()
+} else {
+    $BootstrapTokenActual = (& $PythonExe -m qkd_sdwan.controller.cli init-config --output "$ConfigPath" --host "$BindHost" --port "$Port" --subnet-prefix "$SubnetPrefix" --bootstrap-token "$BootstrapToken" | Select-Object -Last 1).ToString().Trim()
 }
-with open(r'$ConfigPath', 'w', encoding='utf-8') as f:
-    json.dump(cfg, f, indent=2)
-print(token)
-"@
+if ($LASTEXITCODE -ne 0 -or -not (Test-Path $ConfigPath)) {
+    Write-Error "Failed to generate controller configuration at $ConfigPath"
+    exit 1
+}
 
-$BootstrapTokenActual = & python -c $TokenCode
+Write-Host "[4/4] Generating CLI wrappers, updating User PATH, and creating Scheduled Task script..." -ForegroundColor Yellow
+$Utf8NoBom = [System.Text.UTF8Encoding]::new($false)
 
-Write-Host "[4/4] Generating CLI wrappers and Scheduled Task installer..." -ForegroundColor Yellow
 $BatchWrapper = "$Prefix\bin\qkd-sdwan-controller.bat"
-@"
-@echo off
-set PYTHONPATH=$PyzDest;$RepoRoot;%PYTHONPATH%
-python -m qkd_sdwan.controller.cli --config "$ConfigPath" %*
-"@ | Set-Content -Path $BatchWrapper -Encoding ASCII
+$BatchContent = "@echo off`r`n" +
+    "set `"PYTHONPATH=$PyzDest;$RepoRoot;%PYTHONPATH%`"`r`n" +
+    "set `"QKD_SDWAN_CONTROLLER_CONFIG=$ConfigPath`"`r`n" +
+    "`"$PythonExe`" -m qkd_sdwan.controller.cli --config `"$ConfigPath`" %*`r`n"
+[System.IO.File]::WriteAllText($BatchWrapper, $BatchContent, $Utf8NoBom)
 
 Copy-Item -Force $BatchWrapper "$Prefix\bin\qkd-sdwan-ctl.bat"
 
 $Ps1Wrapper = "$Prefix\bin\qkd-sdwan-controller.ps1"
-@"
-`$env:PYTHONPATH = "$PyzDest;$RepoRoot;`$env:PYTHONPATH"
-python -m qkd_sdwan.controller.cli --config "$ConfigPath" @args
-"@ | Set-Content -Path $Ps1Wrapper -Encoding UTF8
+$Ps1Content = "`$env:PYTHONPATH = `"$PyzDest;$RepoRoot;`$env:PYTHONPATH`"`r`n" +
+    "`$env:QKD_SDWAN_CONTROLLER_CONFIG = `"$ConfigPath`"`r`n" +
+    "& `"$PythonExe`" -m qkd_sdwan.controller.cli --config `"$ConfigPath`" @args`r`n"
+[System.IO.File]::WriteAllText($Ps1Wrapper, $Ps1Content, $Utf8NoBom)
 
 $TaskScript = "$Prefix\register-windows-service.ps1"
-@"
-# Run as Administrator to register startup task
-schtasks.exe /Create /TN "QKD-SDWAN-Controller" /TR "$BatchWrapper serve" /SC ONSTART /RU "SYSTEM" /F
-Write-Host "[+] QKD-SDWAN Controller registered as Windows ONSTART task"
-"@ | Set-Content -Path $TaskScript -Encoding UTF8
+$TaskContent = "# Run as Administrator to register startup task`r`n" +
+    "schtasks.exe /Create /TN `"QKD-SDWAN-Controller`" /TR `"`"$BatchWrapper`" serve`" /SC ONSTART /RU `"SYSTEM`" /F`r`n" +
+    "Write-Host `"[+] QKD-SDWAN Controller registered as Windows ONSTART task`"`r`n"
+[System.IO.File]::WriteAllText($TaskScript, $TaskContent, $Utf8NoBom)
+
+$BinDir = "$Prefix\bin"
+if (($env:PATH -split ";") -notcontains $BinDir) {
+    $env:PATH = "$BinDir;$env:PATH"
+}
+try {
+    $UserPath = [Environment]::GetEnvironmentVariable("Path", "User")
+    if ([string]::IsNullOrWhiteSpace($UserPath)) {
+        [Environment]::SetEnvironmentVariable("Path", $BinDir, "User")
+    } elseif (($UserPath -split ";") -notcontains $BinDir) {
+        [Environment]::SetEnvironmentVariable("Path", "$UserPath;$BinDir", "User")
+    }
+} catch {
+}
 
 Write-Host "`n[OK] QKD-SDWAN Central Controller installed successfully on Windows:" -ForegroundColor Green
 Write-Host "     Configuration       : $ConfigPath"

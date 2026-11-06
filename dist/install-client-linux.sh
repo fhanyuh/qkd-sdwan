@@ -15,6 +15,7 @@ QKD_PORT="52820"
 INTERFACE_NAME="wg-qkd0"
 NON_INTERACTIVE=0
 EXPLICIT_FLAGS=0
+EXPLICIT_IP=0
 
 usage() {
   cat <<EOF
@@ -51,6 +52,7 @@ while [[ $# -gt 0 ]]; do
     --overlay-ip)
       OVERLAY_IP="$2"
       EXPLICIT_FLAGS=1
+      EXPLICIT_IP=1
       shift 2
       ;;
     --controller-url)
@@ -108,7 +110,10 @@ if [[ "${NON_INTERACTIVE}" -eq 0 && "${EXPLICIT_FLAGS}" -eq 0 && -t 0 ]]; then
   JOIN_TOKEN="${input_tok:-${JOIN_TOKEN}}"
   if [[ -z "${JOIN_TOKEN}" ]]; then
     read -r -p "Overlay IPv4 address [${OVERLAY_IP}]: " input_ip
-    OVERLAY_IP="${input_ip:-${OVERLAY_IP}}"
+    if [[ -n "${input_ip}" ]]; then
+      OVERLAY_IP="${input_ip}"
+      EXPLICIT_IP=1
+    fi
   fi
   read -r -p "WireGuard UDP port [${WG_PORT}]: " input_wg
   WG_PORT="${input_wg:-${WG_PORT}}"
@@ -133,6 +138,12 @@ if command -v wg >/dev/null 2>&1 && [[ "$(id -u)" -eq 0 ]]; then
 fi
 echo "      Python runtime : ${PYTHON_BIN}"
 echo "      WireGuard mode : ${WG_MODE}"
+if ! "${PYTHON_BIN}" -c "import cryptography" >/dev/null 2>&1; then
+  echo "      Installing required Python package 'cryptography'..."
+  "${PYTHON_BIN}" -m pip install --disable-pip-version-check --user cryptography || \
+    "${PYTHON_BIN}" -m pip install --disable-pip-version-check --break-system-packages cryptography || \
+    "${PYTHON_BIN}" -m pip install --disable-pip-version-check cryptography
+fi
 
 echo "[2/4] Creating endpoint directories under ${PREFIX}..."
 mkdir -p "${PREFIX}/etc" "${PREFIX}/bin" "${PREFIX}/lib"
@@ -157,67 +168,21 @@ echo "[3/4] Configuring endpoint identity, WireGuard keypair, and Controller enr
 export PYTHONPATH="${PYZ_DEST}:${REPO_ROOT}:${PYTHONPATH:-}"
 CONFIG_PATH="${PREFIX}/etc/endpoint.json"
 
-"${PYTHON_BIN}" -c "
-import json, secrets, sys, time, urllib.error, urllib.request
-from qkd_sdwan.client.wg_manager import generate_wg_keypair
-
-priv, pub = generate_wg_keypair()
-join_token = '${JOIN_TOKEN}'.strip()
-ctrl_url = '${CONTROLLER_URL}'.rstrip('/')
-node_id = '${NODE_ID}'
-overlay_ip = '${OVERLAY_IP}'
-hmac_secret = secrets.token_hex(32)
-auth_token_id = 'hmac-sha256-cluster-v1'
-enrolled_token_id = None
-
-if join_token:
-    try:
-        req_data = {
-            'join_token': join_token,
-            'node_id': node_id,
-            'underlay_host': '127.0.0.1',
-            'wg_port': int('${WG_PORT}'),
-            'qkd_port': int('${QKD_PORT}'),
-            'wg_public_key': pub,
-            'overlay_ip': overlay_ip if '${EXPLICIT_FLAGS}' == '1' else None,
-        }
-        body = json.dumps(req_data).encode('utf-8')
-        req = urllib.request.Request(
-            f'{ctrl_url}/api/v1/nodes/enroll',
-            data=body,
-            headers={'Content-Type': 'application/json'},
-            method='POST',
-        )
-        with urllib.request.urlopen(req, timeout=3.0) as resp:
-            data = json.loads(resp.read().decode('utf-8'))
-            overlay_ip = data.get('allocated_overlay_ip', overlay_ip)
-            hmac_secret = data.get('cluster_hmac_secret_hex', hmac_secret)
-            auth_token_id = data.get('auth_token_id', f'enrolled-{data.get(\"token_id\", \"tok\")}')
-            enrolled_token_id = data.get('token_id')
-            print(f'      [+] Successfully enrolled {node_id} via Join Token (allocated IP: {overlay_ip})')
-    except Exception as exc:
-        print(f'      [!] Controller enrollment skipped ({exc}); configuring standalone keys')
-
-cfg = {
-    'node_id': node_id,
-    'overlay_ip': overlay_ip,
-    'interface_name': '${INTERFACE_NAME}',
-    'controller_url': ctrl_url,
-    'wg_port': int('${WG_PORT}'),
-    'qkd_port': int('${QKD_PORT}'),
-    'wg_backend_mode': '${WG_MODE}',
-    'wg_private_key': priv,
-    'wg_public_key': pub,
-    'classical_hmac_secret_hex': hmac_secret,
-    'cluster_hmac_secret_hex': hmac_secret,
-    'auth_token_id': auth_token_id,
-    'enrolled_token_id': enrolled_token_id,
-    'qber_abort_threshold': 0.11,
-    'generated_at': time.time(),
-}
-with open('${CONFIG_PATH}', 'w', encoding='utf-8') as f:
-    json.dump(cfg, f, indent=2)
-"
+INIT_EXTRA_ARGS=()
+if [[ "${EXPLICIT_IP}" -eq 1 ]]; then
+  INIT_EXTRA_ARGS+=("--explicit-ip")
+fi
+"${PYTHON_BIN}" -m qkd_sdwan.client.agent init-config \
+  --output "${CONFIG_PATH}" \
+  --node-id "${NODE_ID}" \
+  --overlay-ip "${OVERLAY_IP}" \
+  --controller-url "${CONTROLLER_URL}" \
+  --join-token "${JOIN_TOKEN}" \
+  --wg-port "${WG_PORT}" \
+  --qkd-port "${QKD_PORT}" \
+  --interface "${INTERFACE_NAME}" \
+  --backend-mode "${WG_MODE}" \
+  "${INIT_EXTRA_ARGS[@]}"
 chmod 600 "${CONFIG_PATH}"
 
 echo "[4/4] Installing CLI wrappers (qkd-sdwan-client, qkd-sdwan-agent) and systemd service..."
@@ -226,6 +191,7 @@ cat > "${CLIENT_BIN}" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
 export PYTHONPATH="${PYZ_DEST}:${REPO_ROOT}:\${PYTHONPATH:-}"
+export QKD_SDWAN_CLIENT_CONFIG="${CONFIG_PATH}"
 exec "${PYTHON_BIN}" -m qkd_sdwan.client.agent --config "${CONFIG_PATH}" "\$@"
 EOF
 chmod +x "${CLIENT_BIN}"
@@ -235,6 +201,7 @@ cat > "${AGENT_BIN}" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
 export PYTHONPATH="${PYZ_DEST}:${REPO_ROOT}:\${PYTHONPATH:-}"
+export QKD_SDWAN_CLIENT_CONFIG="${CONFIG_PATH}"
 exec "${PYTHON_BIN}" -m qkd_sdwan.client.agent --config "${CONFIG_PATH}" "\$@"
 EOF
 chmod +x "${AGENT_BIN}"

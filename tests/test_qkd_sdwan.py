@@ -29,7 +29,7 @@ from qkd_sdwan.common.models import (
     RouteDirective,
     RouteMode,
 )
-from qkd_sdwan.controller.cli import render_controller_dashboard
+from qkd_sdwan.controller.cli import main as controller_cli_main, render_controller_dashboard
 from qkd_sdwan.controller.ml_engine import IsolationForestDetector, OverlayRouteOptimizer
 from qkd_sdwan.controller.server import SDWANControllerServer
 
@@ -691,6 +691,170 @@ class TestQKDSDWANSuite(unittest.TestCase):
         finally:
             for n in nodes:
                 n.close()
+            controller.shutdown()
+
+    def test_init_config_subcommand_config_precedence_and_windows_hardening(self) -> None:
+        """Verify init-config subcommands, pre-subcommand --config preservation, Windows socket/host normalization, and installers."""
+        repo_root = Path(__file__).resolve().parents[1]
+        build_script = repo_root / "scripts" / "build_installers.py"
+        subprocess.run([sys.executable, str(build_script)], capture_output=True, text=True, check=True)
+        dist_dir = repo_root / "dist"
+
+        # 1. Verify Windows address normalization (0.0.0.0 -> 127.0.0.1)
+        self.assertEqual(WireGuardTunnelDaemon._parse_endpoint("0.0.0.0:51820"), ("127.0.0.1", 51820))
+        self.assertEqual(WireGuardTunnelDaemon._parse_endpoint(":::51820"), ("127.0.0.1", 51820))
+
+        controller = SDWANControllerServer(host="0.0.0.0", port=0, bootstrap_join_token="qkd-join-winhard-2025")
+        controller.start_background()
+        try:
+            self.assertTrue(controller.base_url.startswith("http://127.0.0.1:"))
+            ctrl_port = controller.port
+
+            with tempfile.TemporaryDirectory(prefix="qkd-winhard-") as tmpdir:
+                tmp_path = Path(tmpdir)
+
+                # 2. Verify `qkd-sdwan-controller init-config`
+                ctrl_cfg_path = tmp_path / "ctrl" / "controller.json"
+                tok_buf = io.StringIO()
+                with redirect_stdout(tok_buf):
+                    rc = controller_cli_main(
+                        [
+                            "init-config",
+                            "--output",
+                            str(ctrl_cfg_path),
+                            "--host",
+                            "0.0.0.0",
+                            "--port",
+                            str(ctrl_port),
+                            "--subnet-prefix",
+                            "10.200.0.",
+                            "--bootstrap-token",
+                            "qkd-join-winhard-2025",
+                        ]
+                    )
+                self.assertEqual(rc, 0)
+                self.assertEqual(tok_buf.getvalue().strip(), "qkd-join-winhard-2025")
+                ctrl_cfg = json.loads(ctrl_cfg_path.read_text(encoding="utf-8"))
+                self.assertEqual(ctrl_cfg["port"], ctrl_port)
+                self.assertEqual(ctrl_cfg["bootstrap_join_token"], "qkd-join-winhard-2025")
+
+                # Verify `qkd-sdwan-controller --config <path> dashboard --once` resolves port from config
+                ctrl_dash_buf = io.StringIO()
+                with redirect_stdout(ctrl_dash_buf):
+                    rc = controller_cli_main(["--config", str(ctrl_cfg_path), "dashboard", "--once"])
+                self.assertEqual(rc, 0)
+                self.assertIn(f"http://127.0.0.1:{ctrl_port}", ctrl_dash_buf.getvalue())
+
+                # 3. Verify `qkd-sdwan-client init-config` with Join Token dynamic IP allocation (without --explicit-ip)
+                client1_cfg_path = tmp_path / "client1" / "endpoint.json"
+                client2_cfg_path = tmp_path / "client2" / "endpoint.json"
+                for idx, (nid, cpath) in enumerate(
+                    [("edge-win-01", client1_cfg_path), ("edge-win-02", client2_cfg_path)],
+                    start=1,
+                ):
+                    out_buf = io.StringIO()
+                    with redirect_stdout(out_buf):
+                        rc = client_cli_main(
+                            [
+                                "init-config",
+                                "--output",
+                                str(cpath),
+                                "--node-id",
+                                nid,
+                                "--overlay-ip",
+                                "10.200.0.10",
+                                "--controller-url",
+                                controller.base_url,
+                                "--join-token",
+                                "qkd-join-winhard-2025",
+                                "--wg-port",
+                                str(51820 + idx),
+                                "--qkd-port",
+                                str(52820 + idx),
+                            ]
+                        )
+                    self.assertEqual(rc, 0)
+
+                c1_data = json.loads(client1_cfg_path.read_text(encoding="utf-8"))
+                c2_data = json.loads(client2_cfg_path.read_text(encoding="utf-8"))
+                self.assertEqual(c1_data["node_id"], "edge-win-01")
+                self.assertEqual(c2_data["node_id"], "edge-win-02")
+                # Dynamic allocation must assign distinct IPs rather than colliding on 10.200.0.10
+                self.assertNotEqual(c1_data["overlay_ip"], c2_data["overlay_ip"])
+                self.assertEqual(c1_data["overlay_ip"], "10.200.0.10")
+                self.assertEqual(c2_data["overlay_ip"], "10.200.0.11")
+
+                # 4. Verify `--config <path>` BEFORE subcommand (`dashboard --once` and `status`) does not get overwritten
+                dash_buf = io.StringIO()
+                with redirect_stdout(dash_buf):
+                    rc = client_cli_main(
+                        [
+                            "--config",
+                            str(client2_cfg_path),
+                            "dashboard",
+                            "--once",
+                            "--wg-port",
+                            "0",
+                            "--qkd-port",
+                            "0",
+                        ]
+                    )
+                self.assertEqual(rc, 0)
+                dash_out = dash_buf.getvalue()
+                self.assertIn("edge-win-02", dash_out)
+                self.assertIn("10.200.0.11", dash_out)
+                self.assertNotIn("edge-local-01", dash_out)
+
+                stat_buf = io.StringIO()
+                with redirect_stdout(stat_buf):
+                    rc = client_cli_main(["--config", str(client2_cfg_path), "status", "--json"])
+                self.assertEqual(rc, 0)
+                stat_json = json.loads(stat_buf.getvalue())
+                self.assertEqual(stat_json["node_id"], "edge-win-02")
+                self.assertEqual(stat_json["overlay_ip"], "10.200.0.11")
+
+                # 5. Verify full Linux installer end-to-end execution in temp prefix
+                linux_client_prefix = tmp_path / "installed-client"
+                subprocess.run(
+                    [
+                        "bash",
+                        str(dist_dir / "install-client-linux.sh"),
+                        "--non-interactive",
+                        "--prefix",
+                        str(linux_client_prefix),
+                        "--node-id",
+                        "edge-installed-linux",
+                        "--overlay-ip",
+                        "10.200.0.77",
+                        "--controller-url",
+                        controller.base_url,
+                    ],
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                )
+                wrapper_bin = linux_client_prefix / "bin" / "qkd-sdwan-client"
+                wrap_proc = subprocess.run(
+                    [str(wrapper_bin), "dashboard", "--once", "--wg-port", "0", "--qkd-port", "0"],
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                )
+                self.assertIn("edge-installed-linux", wrap_proc.stdout)
+                self.assertIn("10.200.0.77", wrap_proc.stdout)
+
+                # 6. Verify structural & syntax soundness of Windows PowerShell & Batch installers
+                for ps1_name in ("install-controller-windows.ps1", "install-client-windows.ps1"):
+                    ps1_path = dist_dir / ps1_name
+                    raw_bytes = ps1_path.read_bytes()
+                    self.assertFalse(raw_bytes.startswith(b"\xef\xbb\xbf"), f"{ps1_name} should not start with UTF-8 BOM")
+                    text = raw_bytes.decode("utf-8")
+                    self.assertIn("function Resolve-PythonExe", text)
+                    self.assertIn("import cryptography", text)
+                    self.assertIn("init-config", text)
+                    self.assertIn("[System.Text.UTF8Encoding]::new($false)", text)
+                    self.assertNotIn("python -c", text)
+        finally:
             controller.shutdown()
 
 

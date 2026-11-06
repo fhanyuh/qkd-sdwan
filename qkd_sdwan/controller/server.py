@@ -64,7 +64,8 @@ class SDWANControllerServer:
 
     @property
     def base_url(self) -> str:
-        return f"http://{self.host}:{self.port}"
+        connect_host = "127.0.0.1" if self.host in ("0.0.0.0", "::", "") else self.host
+        return f"http://{connect_host}:{self.port}"
 
     def create_enrollment_token(
         self,
