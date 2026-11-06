@@ -908,7 +908,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     init_p.add_argument("--node-id", type=str, default="edge-node-01", help="Endpoint node ID (default: edge-node-01)")
     init_p.add_argument("--overlay-ip", type=str, default="10.200.0.10", help="Overlay IPv4 address (default: 10.200.0.10)")
     init_p.add_argument("--controller-url", type=str, default="http://127.0.0.1:8080", help="Central Controller base URL")
-    init_p.add_argument("--join-token", type=str, default="", help="Optional Join Token for automatic enrollment")
+    init_p.add_argument("--join-token", nargs="?", const="", type=str, default="", help="Optional Join Token for automatic enrollment")
     init_p.add_argument("--wg-port", type=int, default=51820, help="WireGuard UDP listen port (default: 51820)")
     init_p.add_argument("--qkd-port", type=int, default=52820, help="BB84 QKD TCP listen port (default: 52820)")
     init_p.add_argument("--interface", type=str, default="wg-qkd0", help="WireGuard interface name (default: wg-qkd0)")

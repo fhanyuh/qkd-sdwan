@@ -243,7 +243,7 @@ def build_controller_parser() -> argparse.ArgumentParser:
     init_p.add_argument("--host", default="0.0.0.0", help="Bind IP address (default: 0.0.0.0)")
     init_p.add_argument("--port", type=int, default=8080, help="Bind HTTP port (default: 8080)")
     init_p.add_argument("--subnet-prefix", default="10.200.0.", help="Overlay IPv4 /24 prefix (default: 10.200.0.)")
-    init_p.add_argument("--bootstrap-token", default="", help="Optional custom bootstrap Join Token")
+    init_p.add_argument("--bootstrap-token", nargs="?", const="", default="", help="Optional custom bootstrap Join Token")
 
     # subcommand: dashboard
     dash_p = subparsers.add_parser("dashboard", help="Display the Controller CLI Dashboard")

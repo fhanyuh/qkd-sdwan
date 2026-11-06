@@ -843,12 +843,15 @@ class TestQKDSDWANSuite(unittest.TestCase):
                 self.assertIn("edge-installed-linux", wrap_proc.stdout)
                 self.assertIn("10.200.0.77", wrap_proc.stdout)
 
-                # 6. Verify structural & syntax soundness of Windows PowerShell & Batch installers
                 for ps1_name in ("install-controller-windows.ps1", "install-client-windows.ps1"):
                     ps1_path = dist_dir / ps1_name
                     raw_bytes = ps1_path.read_bytes()
                     self.assertFalse(raw_bytes.startswith(b"\xef\xbb\xbf"), f"{ps1_name} should not start with UTF-8 BOM")
-                    text = raw_bytes.decode("utf-8")
+                    self.assertTrue(
+                        all(b < 128 for b in raw_bytes),
+                        f"{ps1_name} must be pure 7-bit ASCII so Windows PowerShell 5.1 (Windows-1252) never misparses UTF-8 punctuation",
+                    )
+                    text = raw_bytes.decode("ascii")
                     self.assertIn("function Resolve-PythonExe", text)
                     self.assertIn("import cryptography", text)
                     self.assertIn("init-config", text)

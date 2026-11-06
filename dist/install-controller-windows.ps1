@@ -45,7 +45,7 @@ $HasExplicitConfigFlags = (
 
 if (-not $NonInteractive -and -not $HasExplicitConfigFlags -and [Environment]::UserInteractive) {
     Write-Host "================================================================================" -ForegroundColor Cyan
-    Write-Host " QKD-SDWAN Central Controller — Interactive Windows CLI Installer Wizard" -ForegroundColor Cyan
+    Write-Host " QKD-SDWAN Central Controller -- Interactive Windows CLI Installer Wizard" -ForegroundColor Cyan
     Write-Host "================================================================================" -ForegroundColor Cyan
     $p = Read-Host "Installation directory [$Prefix]"
     if ($p) { $Prefix = $p }
@@ -156,11 +156,17 @@ Write-Host "[3/4] Generating cluster HMAC secret, bootstrap Join Token, and cont
 $ConfigPath = "$Prefix\etc\controller.json"
 $env:PYTHONPATH = "$PyzDest;$RepoRoot;$env:PYTHONPATH"
 
-if (Test-Path $PyzDest) {
-    $BootstrapTokenActual = (& $PythonExe $PyzDest init-config --output "$ConfigPath" --host "$BindHost" --port "$Port" --subnet-prefix "$SubnetPrefix" --bootstrap-token "$BootstrapToken" | Select-Object -Last 1).ToString().Trim()
-} else {
-    $BootstrapTokenActual = (& $PythonExe -m qkd_sdwan.controller.cli init-config --output "$ConfigPath" --host "$BindHost" --port "$Port" --subnet-prefix "$SubnetPrefix" --bootstrap-token "$BootstrapToken" | Select-Object -Last 1).ToString().Trim()
+$InitArgs = @(
+    "-m", "qkd_sdwan.controller.cli", "init-config",
+    "--output", "$ConfigPath",
+    "--host", "$BindHost",
+    "--port", "$Port",
+    "--subnet-prefix", "$SubnetPrefix"
+)
+if (-not [string]::IsNullOrWhiteSpace($BootstrapToken)) {
+    $InitArgs += @("--bootstrap-token", "$BootstrapToken")
 }
+$BootstrapTokenActual = (& $PythonExe @InitArgs | Select-Object -Last 1).ToString().Trim()
 if ($LASTEXITCODE -ne 0 -or -not (Test-Path $ConfigPath)) {
     Write-Error "Failed to generate controller configuration at $ConfigPath"
     exit 1

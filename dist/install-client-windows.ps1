@@ -50,7 +50,7 @@ $HasExplicitConfigFlags = (
 
 if (-not $NonInteractive -and -not $HasExplicitConfigFlags -and [Environment]::UserInteractive) {
     Write-Host "================================================================================" -ForegroundColor Cyan
-    Write-Host " QKD-SDWAN Endpoint Client — Interactive Windows CLI Installer Wizard" -ForegroundColor Cyan
+    Write-Host " QKD-SDWAN Endpoint Client -- Interactive Windows CLI Installer Wizard" -ForegroundColor Cyan
     Write-Host "================================================================================" -ForegroundColor Cyan
     $p = Read-Host "Installation directory [$Prefix]"
     if ($p) { $Prefix = $p }
@@ -170,16 +170,22 @@ Write-Host "[3/4] Generating WireGuard keypair and enrolling with Controller..."
 $ConfigPath = "$Prefix\etc\endpoint.json"
 $env:PYTHONPATH = "$PyzDest;$RepoRoot;$env:PYTHONPATH"
 
-$ExtraFlags = @()
+$InitArgs = @(
+    "-m", "qkd_sdwan.client.agent", "init-config",
+    "--output", "$ConfigPath",
+    "--node-id", "$NodeId",
+    "--overlay-ip", "$OverlayIp",
+    "--controller-url", "$ControllerUrl",
+    "--wg-port", "$WgPort",
+    "--qkd-port", "$QkdPort"
+)
+if (-not [string]::IsNullOrWhiteSpace($JoinToken)) {
+    $InitArgs += @("--join-token", "$JoinToken")
+}
 if ($ExplicitIp) {
-    $ExtraFlags += "--explicit-ip"
+    $InitArgs += "--explicit-ip"
 }
-
-if (Test-Path $PyzDest) {
-    & $PythonExe $PyzDest init-config --output "$ConfigPath" --node-id "$NodeId" --overlay-ip "$OverlayIp" --controller-url "$ControllerUrl" --join-token "$JoinToken" --wg-port "$WgPort" --qkd-port "$QkdPort" @ExtraFlags
-} else {
-    & $PythonExe -m qkd_sdwan.client.agent init-config --output "$ConfigPath" --node-id "$NodeId" --overlay-ip "$OverlayIp" --controller-url "$ControllerUrl" --join-token "$JoinToken" --wg-port "$WgPort" --qkd-port "$QkdPort" @ExtraFlags
-}
+& $PythonExe @InitArgs
 if ($LASTEXITCODE -ne 0 -or -not (Test-Path $ConfigPath)) {
     Write-Error "Failed to initialize client configuration at $ConfigPath"
     exit 1

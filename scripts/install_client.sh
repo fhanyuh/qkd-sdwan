@@ -98,7 +98,7 @@ done
 
 if [[ "${NON_INTERACTIVE}" -eq 0 && "${EXPLICIT_FLAGS}" -eq 0 && -t 0 ]]; then
   echo "================================================================================"
-  echo " QKD-SDWAN Endpoint Client — Interactive Linux CLI Installer Wizard"
+  echo " QKD-SDWAN Endpoint Client -- Interactive Linux CLI Installer Wizard"
   echo "================================================================================"
   read -r -p "Installation directory [${PREFIX}]: " input_prefix
   PREFIX="${input_prefix:-${PREFIX}}"

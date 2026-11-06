@@ -7,40 +7,40 @@
       "platform": "all",
       "type": "zipapp",
       "component": "controller",
-      "size_bytes": 167477,
-      "sha256": "733224bb48143019153980081ea5fd48660e584521d35dbec9b9f14c1b4b944e"
+      "size_bytes": 167581,
+      "sha256": "5714426eb29c355ce949d2e0fa3df6867ef466687f41a3de58a0f564ccb1e6b3"
     },
     {
       "filename": "qkd-sdwan-client.pyz",
       "platform": "all",
       "type": "zipapp",
       "component": "client",
-      "size_bytes": 167473,
-      "sha256": "ada51cdfab0b5690db186107eb9543fdd064519cad58e62a00c29f7ac40bcc2b"
+      "size_bytes": 167577,
+      "sha256": "8e8794c1f68b5c1d2e9dbabb5e63278e063226f95d5bf9d333d8b6002a034725"
     },
     {
       "filename": "install-controller-linux.sh",
       "platform": "linux",
       "type": "shell-installer",
       "component": "controller",
-      "size_bytes": 6152,
-      "sha256": "da9688bfbb97c35d2ff78853bfd899d28656c6aebe32558848cb8b81bb9fa946"
+      "size_bytes": 6151,
+      "sha256": "b516ddf7cd24073c4bf44ce0a29db5cadafea21469c9f43838cd28469a9a15bd"
     },
     {
       "filename": "install-client-linux.sh",
       "platform": "linux",
       "type": "shell-installer",
       "component": "client",
-      "size_bytes": 7315,
-      "sha256": "3e8918f18fea4173c107f981b2701c02eeb9e70e65a69bec0be8760cc2ee9975"
+      "size_bytes": 7314,
+      "sha256": "40f0ff71c17afc91cda521a1d99817e2a1f275d457cf8bb8289c86ef8ead6cf2"
     },
     {
       "filename": "install-controller-windows.ps1",
       "platform": "windows",
       "type": "powershell-installer",
       "component": "controller",
-      "size_bytes": 9148,
-      "sha256": "3ff7ec3e71b3046c9ed1f59b62ab41741cbfa9b4eec90108e4cb6fcecca73d0d"
+      "size_bytes": 9029,
+      "sha256": "e686975d57ba0400515d5857ec8011e7cf3cc9c35647e1552912b064a83437fe"
     },
     {
       "filename": "install-controller-windows.bat",
@@ -55,8 +55,8 @@
       "platform": "windows",
       "type": "powershell-installer",
       "component": "client",
-      "size_bytes": 9470,
-      "sha256": "7e8b4ee00ccad94e52c6e1a5bebbdb20bb122c67969a0d61313732b6bee00fab"
+      "size_bytes": 9339,
+      "sha256": "ec05d95cf5aa27da3749e005013e4417293f449ed0142329fa2bbc1093f2a247"
     },
     {
       "filename": "install-client-windows.bat",
