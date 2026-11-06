@@ -1,0 +1,70 @@
+{
+  "project": "qkd-sdwan-poc",
+  "version": "0.1.0",
+  "artifacts": [
+    {
+      "filename": "qkd-sdwan-controller.pyz",
+      "platform": "all",
+      "type": "zipapp",
+      "component": "controller",
+      "size_bytes": 160679,
+      "sha256": "f193b583274316724cc7254682dab52f2841f4918ac1ba8cf47dd201579c0f4a"
+    },
+    {
+      "filename": "qkd-sdwan-client.pyz",
+      "platform": "all",
+      "type": "zipapp",
+      "component": "client",
+      "size_bytes": 160675,
+      "sha256": "fd333c73687993da6231510bfd97dbd674a1831da553f375ca07efe88762ec2a"
+    },
+    {
+      "filename": "install-controller-linux.sh",
+      "platform": "linux",
+      "type": "shell-installer",
+      "component": "controller",
+      "size_bytes": 5857,
+      "sha256": "e98caf6e6121b3db329a6fc224435ad84b16183dad62efd217c14ae4c340e9c1"
+    },
+    {
+      "filename": "install-client-linux.sh",
+      "platform": "linux",
+      "type": "shell-installer",
+      "component": "client",
+      "size_bytes": 8577,
+      "sha256": "2b0843ff46d90dfa40c4e450aa0ac1bdf311f2e561a1743e6167cdf65dab300e"
+    },
+    {
+      "filename": "install-controller-windows.ps1",
+      "platform": "windows",
+      "type": "powershell-installer",
+      "component": "controller",
+      "size_bytes": 4868,
+      "sha256": "2ce665388953abf2eb0dba4b7152a083038ec3d70e93f0e1811b777a253ea31b"
+    },
+    {
+      "filename": "install-controller-windows.bat",
+      "platform": "windows",
+      "type": "batch-installer",
+      "component": "controller",
+      "size_bytes": 109,
+      "sha256": "ba740e873975ab94e66cd6a2d9bf20ef2e322acc5f6e620ffef14eb3ec511ff7"
+    },
+    {
+      "filename": "install-client-windows.ps1",
+      "platform": "windows",
+      "type": "powershell-installer",
+      "component": "client",
+      "size_bytes": 6718,
+      "sha256": "5f1f29a81db935407589512d88a2cfd4e7fbf3e44c92de22dbd76a96e40c7ff6"
+    },
+    {
+      "filename": "install-client-windows.bat",
+      "platform": "windows",
+      "type": "batch-installer",
+      "component": "client",
+      "size_bytes": 105,
+      "sha256": "081024e0c7e07710b87eb92c1451a104861c46a4632100b7b68bbcc068f371ba"
+    }
+  ]
+}

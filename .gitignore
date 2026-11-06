@@ -1,0 +1,25 @@
+# Python byte-compiled / cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Packaging / build intermediates (keep dist/ tracked for ready-to-run installers)
+build/
+*.egg-info/
+!dist/
+!dist/*
+
+# Test / coverage / IDE
+.pytest_cache/
+.coverage
+.mypy_cache/
+.ruff_cache/
+.idea/
+.vscode/
+*.swp
+.DS_Store

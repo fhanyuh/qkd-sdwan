@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "qkd-sdwan"
+version = "0.1.0"
+description = "Distributed P2P SD-WAN with Socket-Based BB84 QKD Simulation, Isolation Forest ML Controller, Join-Token Auto-Enrollment, and Encrypted P2P Data Transfer"
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [
+    { name = "Rafhan Mazaya Fathurrahman" }
+]
+dependencies = [
+    "cryptography>=41.0.0",
+]
+
+[project.scripts]
+qkd-sdwan-controller = "qkd_sdwan.controller.cli:main"
+qkd-sdwan-ctl = "qkd_sdwan.controller.cli:main"
+qkd-sdwan-client = "qkd_sdwan.client.agent:main"
+qkd-sdwan-agent = "qkd_sdwan.client.agent:main"
+
+[tool.setuptools.packages.find]
+include = ["qkd_sdwan*"]
