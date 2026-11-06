@@ -7,16 +7,16 @@
       "platform": "all",
       "type": "zipapp",
       "component": "controller",
-      "size_bytes": 171208,
-      "sha256": "45b0f71864b691232112343759cc24b4b46dc2ff21d4c5da865e8f5d249985c8"
+      "size_bytes": 171854,
+      "sha256": "3dd4ed67f2bdc5d329e2822a0d4ca3d4bb5e7025047dfa3f5e8f594714175963"
     },
     {
       "filename": "qkd-sdwan-client.pyz",
       "platform": "all",
       "type": "zipapp",
       "component": "client",
-      "size_bytes": 171204,
-      "sha256": "138ff326673ae7abfd5c07fb342fc3207909d9b4f16d43c3ea489bab1ec408af"
+      "size_bytes": 171850,
+      "sha256": "168dd35d72041a2234ac2b9b4bc60953408cb038f7c45f82e720b32a378598ab"
     },
     {
       "filename": "install-controller-linux.sh",

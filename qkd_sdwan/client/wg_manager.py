@@ -127,7 +127,8 @@ class WireGuardTunnelDaemon:
         try:
             if os.name != "nt":
                 self._udp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            self._udp_sock.bind((self.bind_host, self.listen_port))
+            sock_bind_host = "127.0.0.1" if self.bind_host in ("127.0.0.1", "localhost", "::1") else "0.0.0.0"
+            self._udp_sock.bind((sock_bind_host, self.listen_port))
             if hasattr(socket, "SIO_UDP_CONNRESET"):
                 try:
                     self._udp_sock.ioctl(socket.SIO_UDP_CONNRESET, False)
@@ -536,7 +537,8 @@ class WireGuardTunnelDaemon:
 
         reply_ep = msg.get("origin_endpoint")
         reply_addr = self._parse_endpoint(str(reply_ep)) if reply_ep else sender_addr
-
+        if reply_addr[0] == "127.0.0.1" and sender_addr[0] not in ("127.0.0.1", "::1"):
+            reply_addr = (sender_addr[0], reply_addr[1])
         if aead_key is None:
             with self._lock:
                 self.auth_failure_count += 1

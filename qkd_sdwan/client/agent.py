@@ -163,7 +163,7 @@ class SDWANEndpointAgent:
             listen_port=wg_port,
             private_key_b64=private_key_b64,
             prefer_kernel_wg=prefer_kernel_wg,
-            bind_host=bind_host,
+            bind_host=self.underlay_host,
         )
         self.wg_port = self.wg_daemon.bound_port
 
@@ -833,8 +833,8 @@ def run_client_dashboard_interactive(agent: SDWANEndpointAgent) -> int:
             print(f" [!] Warning: Cannot reach Controller at {agent.controller_url}: {exc}")
         print("\n" + render_client_dashboard(agent))
         print(
-            " Actions: [r] Refresh & Sync | [k] Rekey BB84 Peer | [m] Send P2P Text | "
-            "[f] Send P2P File | [s] Save Inbox File | [q] Quit"
+            " Actions: [r] Refresh & Sync | [c] Change Controller URL | [k] Rekey BB84 Peer | "
+            "[m] Send P2P Text | [f] Send P2P File | [s] Save Inbox File | [q] Quit"
         )
         try:
             choice = input(f" {agent.node_id} dashboard> ").strip().lower()
@@ -844,6 +844,16 @@ def run_client_dashboard_interactive(agent: SDWANEndpointAgent) -> int:
         if choice in ("q", "quit", "exit"):
             break
         if choice in ("r", "refresh", ""):
+            continue
+        if choice == "c":
+            new_url = input(f"   New Controller URL [{agent.controller_url}]: ").strip()
+            if new_url:
+                if not new_url.startswith(("http://", "https://")):
+                    new_url = f"http://{new_url}"
+                agent.controller_url = new_url.rstrip("/")
+                agent.exporter = TelemetryExporter(controller_url=agent.controller_url)
+                agent.underlay_host = _detect_underlay_host(agent.controller_url, None)
+                agent.wg_daemon.bind_host = agent.underlay_host
             continue
         if choice == "k":
             peer_id = input("   Target peer node ID: ").strip()
