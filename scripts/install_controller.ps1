@@ -209,6 +209,12 @@ try {
     }
 } catch {
 }
+if ($IsAdmin) {
+    $PrevErr = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    netsh advfirewall firewall add rule name="QKD-SDWAN Controller TCP $Port" dir=in action=allow protocol=TCP localport=$Port >$null 2>&1
+    $ErrorActionPreference = $PrevErr
+}
 
 Write-Host "`n[OK] QKD-SDWAN Central Controller installed successfully on Windows:" -ForegroundColor Green
 Write-Host "     Configuration       : $ConfigPath"
@@ -216,4 +222,5 @@ Write-Host "     Portable Bundle     : $PyzDest"
 Write-Host "     Batch CLI Wrapper   : $BatchWrapper"
 Write-Host "     PowerShell Wrapper  : $Ps1Wrapper"
 Write-Host "     Bootstrap Join Token: $BootstrapTokenActual"
-Write-Host "     Dashboard Command   : $BatchWrapper dashboard --controller-url http://127.0.0.1:$Port"
+Write-Host "     Start Server Cmd    : & `"$BatchWrapper`" serve --dashboard"
+Write-Host "     Dashboard Snapshot  : & `"$BatchWrapper`" dashboard --once"

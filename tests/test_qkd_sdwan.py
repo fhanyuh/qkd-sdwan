@@ -833,6 +833,7 @@ class TestQKDSDWANSuite(unittest.TestCase):
                     text=True,
                     check=True,
                 )
+                self.assertIn("edge-installed-linux", controller.get_cluster_status()["nodes"])
                 wrapper_bin = linux_client_prefix / "bin" / "qkd-sdwan-client"
                 wrap_proc = subprocess.run(
                     [str(wrapper_bin), "dashboard", "--once", "--wg-port", "0", "--qkd-port", "0"],

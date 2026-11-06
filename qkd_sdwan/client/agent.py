@@ -9,10 +9,11 @@ import json
 import os
 from pathlib import Path
 import secrets
+import socket
 import threading
 import time
 from typing import Any
-from urllib import error, request
+from urllib import error, parse, request
 from qkd_sdwan.client.bb84_engine import BB84ProtocolEngine, QuantumChannelParams
 from qkd_sdwan.client.wg_manager import WireGuardTunnelDaemon, generate_wg_keypair
 from qkd_sdwan.common.models import (
@@ -23,6 +24,24 @@ from qkd_sdwan.common.models import (
     RouteDirective,
     RouteMode,
 )
+
+def _detect_underlay_host(controller_url: str, configured_host: str | None = None) -> str:
+    """Detect the local outbound IPv4 address used to reach the Central Controller."""
+    if configured_host and configured_host.strip() not in ("", "127.0.0.1", "0.0.0.0", "localhost", "auto"):
+        return configured_host.strip()
+    try:
+        parsed = parse.urlparse(controller_url)
+        target_host = (parsed.hostname or "").strip()
+        target_port = int(parsed.port or 8080)
+        if target_host and target_host not in ("127.0.0.1", "localhost", "::1", "0.0.0.0"):
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+                s.connect((target_host, target_port))
+                local_ip = s.getsockname()[0]
+                if local_ip and not local_ip.startswith("127."):
+                    return str(local_ip)
+    except Exception:
+        pass
+    return (configured_host or "127.0.0.1").strip() or "127.0.0.1"
 
 
 class TelemetryExporter:
@@ -121,7 +140,7 @@ class SDWANEndpointAgent:
     ) -> None:
         self.node_id = node_id
         self.overlay_ip = overlay_ip
-        self.underlay_host = underlay_host
+        self.underlay_host = _detect_underlay_host(controller_url, underlay_host)
         self.controller_url = controller_url
         self.auth_secret = auth_secret
         self.auth_token_id = "hmac-sha256-cluster-v1"
@@ -136,6 +155,7 @@ class SDWANEndpointAgent:
         self.last_bb84_results: dict[str, BB84SessionResult] = {}
         self.bb84_history: list[BB84SessionResult] = []
 
+        bind_host = "127.0.0.1" if self.underlay_host in ("127.0.0.1", "localhost", "::1") else "0.0.0.0"
         self.wg_daemon = WireGuardTunnelDaemon(
             node_id=node_id,
             interface_name=interface_name,
@@ -143,7 +163,7 @@ class SDWANEndpointAgent:
             listen_port=wg_port,
             private_key_b64=private_key_b64,
             prefer_kernel_wg=prefer_kernel_wg,
-            bind_host=underlay_host,
+            bind_host=bind_host,
         )
         self.wg_port = self.wg_daemon.bound_port
 
@@ -154,7 +174,7 @@ class SDWANEndpointAgent:
         )
         try:
             self.bb84_engine.start_tcp_responder(
-                host=underlay_host,
+                host=bind_host,
                 port=qkd_port,
                 on_key_established=self._on_responder_bb84_completed,
             )
@@ -274,6 +294,13 @@ class SDWANEndpointAgent:
             registered_at=time.time(),
         )
         resp = self.exporter.register_node(reg)
+        node_info = resp.get("node")
+        if isinstance(node_info, dict) and node_info.get("underlay_host"):
+            self.underlay_host = str(node_info["underlay_host"])
+        cluster_secret_hex = resp.get("cluster_hmac_secret_hex")
+        if cluster_secret_hex and self.auth_secret == b"qkd-sdwan-default-hmac-secret":
+            self.auth_secret = bytes.fromhex(str(cluster_secret_hex))
+            self.bb84_engine.auth_secret = self.auth_secret
         for peer_dict in resp.get("peers", []):
             self._ingest_peer_dict(peer_dict)
         return resp
@@ -800,9 +827,10 @@ def run_client_dashboard_interactive(agent: SDWANEndpointAgent) -> int:
     """Run the interactive 4-panel ASCII CLI Dashboard for an SD-WAN Endpoint Client."""
     while True:
         try:
+            agent.register_with_controller()
             agent.sync_topology()
-        except Exception:
-            pass
+        except Exception as exc:
+            print(f" [!] Warning: Cannot reach Controller at {agent.controller_url}: {exc}")
         print("\n" + render_client_dashboard(agent))
         print(
             " Actions: [r] Refresh & Sync | [k] Rekey BB84 Peer | [m] Send P2P Text | "
@@ -913,6 +941,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     init_p.add_argument("--qkd-port", type=int, default=52820, help="BB84 QKD TCP listen port (default: 52820)")
     init_p.add_argument("--interface", type=str, default="wg-qkd0", help="WireGuard interface name (default: wg-qkd0)")
     init_p.add_argument("--backend-mode", type=str, default="USERSPACE_CRYPTO_WG", help="WireGuard backend mode")
+    init_p.add_argument("--underlay-host", type=str, default="auto", help="Underlay IP/hostname reachable by peers (default: auto)")
     init_p.add_argument("--explicit-ip", action="store_true", help="Request the explicit --overlay-ip during Join-Token enrollment")
 
     # subcommand: enroll
@@ -991,17 +1020,19 @@ def _run_init_config(args: argparse.Namespace) -> int:
     interface_name = str(getattr(args, "interface", None) or "wg-qkd0")
     backend_mode = str(getattr(args, "backend_mode", None) or "USERSPACE_CRYPTO_WG")
     explicit_ip = bool(getattr(args, "explicit_ip", False))
+    underlay_host = _detect_underlay_host(ctrl_url, getattr(args, "underlay_host", None))
 
     hmac_secret = secrets.token_hex(32)
     auth_token_id = "hmac-sha256-cluster-v1"
     enrolled_token_id: str | None = None
+    enrolled_ok = False
 
     if join_token:
         try:
             req_data = {
                 "join_token": join_token,
                 "node_id": node_id,
-                "underlay_host": "127.0.0.1",
+                "underlay_host": underlay_host,
                 "wg_port": wg_port,
                 "qkd_port": qkd_port,
                 "wg_public_key": pub,
@@ -1020,13 +1051,47 @@ def _run_init_config(args: argparse.Namespace) -> int:
                 hmac_secret = str(data.get("cluster_hmac_secret_hex", hmac_secret))
                 auth_token_id = str(data.get("auth_token_id", f"enrolled-{data.get('token_id', 'tok')}"))
                 enrolled_token_id = data.get("token_id")
-                print(f"      [+] Successfully enrolled {node_id} via Join Token (allocated IP: {overlay_ip})")
+                node_dict = data.get("node")
+                if isinstance(node_dict, dict) and node_dict.get("underlay_host"):
+                    underlay_host = str(node_dict["underlay_host"])
+                enrolled_ok = True
+                print(f"      [+] Successfully enrolled {node_id} via Join Token at {ctrl_url} (allocated IP: {overlay_ip}, underlay: {underlay_host})")
         except Exception as exc:
-            print(f"      [!] Controller enrollment skipped ({exc}); configuring standalone keys")
+            print(f"      [!] Join-Token enrollment failed at {ctrl_url} ({exc}); attempting direct node registration...")
+
+    if not enrolled_ok:
+        try:
+            reg_data = {
+                "node_id": node_id,
+                "overlay_ip": overlay_ip,
+                "underlay_host": underlay_host,
+                "wg_port": wg_port,
+                "qkd_port": qkd_port,
+                "wg_public_key": pub,
+                "auth_token_id": auth_token_id,
+                "registered_at": time.time(),
+            }
+            body = json.dumps(reg_data).encode("utf-8")
+            req = request.Request(
+                f"{ctrl_url}/api/v1/nodes/register",
+                data=body,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with request.urlopen(req, timeout=3.0) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+                hmac_secret = str(data.get("cluster_hmac_secret_hex", hmac_secret))
+                node_dict = data.get("node")
+                if isinstance(node_dict, dict) and node_dict.get("underlay_host"):
+                    underlay_host = str(node_dict["underlay_host"])
+                print(f"      [+] Registered {node_id} with Controller at {ctrl_url} (overlay IP: {overlay_ip}, underlay: {underlay_host})")
+        except Exception as exc:
+            print(f"      [!] Controller at {ctrl_url} not reachable during install ({exc}); node will register when started")
 
     cfg = {
         "node_id": node_id,
         "overlay_ip": overlay_ip,
+        "underlay_host": underlay_host,
         "interface_name": interface_name,
         "controller_url": ctrl_url,
         "wg_port": wg_port,
@@ -1050,14 +1115,13 @@ def _build_agent_from_args(args: argparse.Namespace) -> SDWANEndpointAgent:
     node_id = getattr(args, "node_id", None) or cfg.get("node_id", "edge-local-01")
     overlay_ip = getattr(args, "overlay_ip", None) or cfg.get("overlay_ip", "10.200.0.10")
     controller_url = getattr(args, "controller_url", None) or cfg.get("controller_url", "http://127.0.0.1:8080")
-    underlay_host = cfg.get("underlay_host", "127.0.0.1")
+    underlay_host = _detect_underlay_host(controller_url, cfg.get("underlay_host"))
     raw_wg_port = getattr(args, "wg_port", None)
     wg_port = int(raw_wg_port) if raw_wg_port is not None else int(cfg.get("wg_port", 0))
     raw_qkd_port = getattr(args, "qkd_port", None)
     qkd_port = int(raw_qkd_port) if raw_qkd_port is not None else int(cfg.get("qkd_port", 0))
     secret_hex = cfg.get("cluster_hmac_secret_hex")
     auth_secret = bytes.fromhex(secret_hex) if secret_hex else b"qkd-sdwan-default-hmac-secret"
-
     join_token = getattr(args, "join_token", None)
     if join_token:
         agent, _ = SDWANEndpointAgent.enroll_with_controller(
@@ -1292,8 +1356,8 @@ def main(argv: list[str] | None = None) -> int:
             try:
                 agent.register_with_controller()
                 agent.sync_topology()
-            except Exception:
-                pass
+            except Exception as exc:
+                print(f"[!] Warning: Could not reach Controller at {agent.controller_url}: {exc}")
             if getattr(args, "once", False):
                 print(render_client_dashboard(agent))
                 return 0

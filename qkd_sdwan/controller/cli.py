@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import secrets
+import socket
 import time
 from typing import Any
 import urllib.error
@@ -286,7 +287,7 @@ def build_controller_parser() -> argparse.ArgumentParser:
 
 def _load_controller_config(args: argparse.Namespace) -> dict[str, Any]:
     cfg: dict[str, Any] = {
-        "host": "127.0.0.1",
+        "host": "0.0.0.0",
         "port": 8080,
         "overlay_subnet_prefix": "10.200.0.",
         "cluster_hmac_secret_hex": None,
@@ -368,16 +369,25 @@ def _run_serve(args: argparse.Namespace) -> int:
     bound_host, bound_port = server.start_background()
     display_host = "127.0.0.1" if bound_host == "0.0.0.0" else bound_host
     ctrl_url = f"http://{display_host}:{bound_port}"
+    lan_ip = display_host
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(("8.8.8.8", 80))
+            lan_ip = s.getsockname()[0]
+    except Exception:
+        pass
+    lan_url = f"http://{lan_ip}:{bound_port}"
 
     print("=" * 96)
     print(f" QKD-SDWAN Central Controller started on http://{bound_host}:{bound_port}")
+    print(f" Local Controller URL : {ctrl_url}")
+    print(f" LAN Controller URL   : {lan_url}  <-- Use this --controller-url from other machines")
     print(f" Bootstrap Join Token : {server.bootstrap_token}")
     print(
-        f" Enroll Client Cmd    : qkd-sdwan-client enroll --controller-url {ctrl_url} "
+        f" Enroll Client Cmd    : qkd-sdwan-client enroll --controller-url {lan_url} "
         f"--join-token {server.bootstrap_token} --node-id edge-node-01"
     )
     print("=" * 96)
-
     try:
         if getattr(args, "dashboard", False):
             while True:

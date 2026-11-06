@@ -246,6 +246,7 @@ class SDWANControllerServer:
             ]
             return {
                 "status": "registered",
+                "cluster_hmac_secret_hex": self.cluster_hmac_secret_hex,
                 "node": registration.to_dict(),
                 "peers": peers,
             }
@@ -424,8 +425,12 @@ class SDWANControllerServer:
                     self._send_json(HTTPStatus.BAD_REQUEST, {"error": f"Invalid JSON body: {exc}"})
                     return
 
+                client_ip = self.client_address[0] if self.client_address else ""
                 if path == "/api/v1/nodes/register":
                     try:
+                        raw_uh = str(data.get("underlay_host", "")).strip()
+                        if raw_uh in ("", "127.0.0.1", "0.0.0.0", "localhost") and client_ip not in ("", "127.0.0.1", "::1"):
+                            data["underlay_host"] = client_ip
                         reg = NodeRegistration.from_dict(data)
                         resp = controller.register_node(reg)
                         self._send_json(HTTPStatus.OK, resp)
@@ -435,10 +440,13 @@ class SDWANControllerServer:
 
                 if path == "/api/v1/nodes/enroll":
                     try:
+                        raw_uh = str(data.get("underlay_host", "127.0.0.1")).strip()
+                        if raw_uh in ("", "127.0.0.1", "0.0.0.0", "localhost") and client_ip not in ("", "127.0.0.1", "::1"):
+                            raw_uh = client_ip
                         resp = controller.enroll_node_with_token(
                             join_token=str(data.get("join_token", "")),
                             node_id=str(data.get("node_id", "")),
-                            underlay_host=str(data.get("underlay_host", "127.0.0.1")),
+                            underlay_host=raw_uh,
                             wg_port=int(data.get("wg_port", 0)),
                             qkd_port=int(data.get("qkd_port", 0)),
                             wg_public_key=str(data.get("wg_public_key", "")),

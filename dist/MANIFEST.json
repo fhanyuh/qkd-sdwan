@@ -7,16 +7,16 @@
       "platform": "all",
       "type": "zipapp",
       "component": "controller",
-      "size_bytes": 167581,
-      "sha256": "5714426eb29c355ce949d2e0fa3df6867ef466687f41a3de58a0f564ccb1e6b3"
+      "size_bytes": 171208,
+      "sha256": "45b0f71864b691232112343759cc24b4b46dc2ff21d4c5da865e8f5d249985c8"
     },
     {
       "filename": "qkd-sdwan-client.pyz",
       "platform": "all",
       "type": "zipapp",
       "component": "client",
-      "size_bytes": 167577,
-      "sha256": "8e8794c1f68b5c1d2e9dbabb5e63278e063226f95d5bf9d333d8b6002a034725"
+      "size_bytes": 171204,
+      "sha256": "138ff326673ae7abfd5c07fb342fc3207909d9b4f16d43c3ea489bab1ec408af"
     },
     {
       "filename": "install-controller-linux.sh",
@@ -39,8 +39,8 @@
       "platform": "windows",
       "type": "powershell-installer",
       "component": "controller",
-      "size_bytes": 9029,
-      "sha256": "e686975d57ba0400515d5857ec8011e7cf3cc9c35647e1552912b064a83437fe"
+      "size_bytes": 9353,
+      "sha256": "319045fedfee3cb0a4a9ca6817eaf774fb3b08fb058a8f39e8d7af73b1d800ae"
     },
     {
       "filename": "install-controller-windows.bat",
@@ -55,8 +55,8 @@
       "platform": "windows",
       "type": "powershell-installer",
       "component": "client",
-      "size_bytes": 9339,
-      "sha256": "ec05d95cf5aa27da3749e005013e4417293f449ed0142329fa2bbc1093f2a247"
+      "size_bytes": 9836,
+      "sha256": "27879ae6d8a7de5ab1b085fadd8dc575f4392d064d6d1feecb178b80ad00793e"
     },
     {
       "filename": "install-client-windows.bat",

@@ -228,10 +228,18 @@ try {
     }
 } catch {
 }
+if ($IsAdmin) {
+    $PrevErr = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    netsh advfirewall firewall add rule name="QKD-SDWAN Client WG UDP $WgPort" dir=in action=allow protocol=UDP localport=$WgPort >$null 2>&1
+    netsh advfirewall firewall add rule name="QKD-SDWAN Client BB84 TCP $QkdPort" dir=in action=allow protocol=TCP localport=$QkdPort >$null 2>&1
+    $ErrorActionPreference = $PrevErr
+}
 
 Write-Host "`n[OK] QKD-SDWAN Endpoint Client installed successfully on Windows:" -ForegroundColor Green
 Write-Host "     Configuration      : $ConfigPath"
 Write-Host "     Portable Bundle    : $PyzDest"
 Write-Host "     Batch CLI Wrapper  : $BatchWrapper"
 Write-Host "     PowerShell Wrapper : $Ps1Wrapper"
-Write-Host "     Interactive Console: $BatchWrapper console"
+Write-Host "     Interactive Console: & `"$BatchWrapper`" console"
+Write-Host "     Interactive Dash   : & `"$BatchWrapper`" dashboard"
