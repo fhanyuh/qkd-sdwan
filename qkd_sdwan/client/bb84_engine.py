@@ -164,6 +164,7 @@ class BB84ProtocolEngine:
         node_id: str,
         auth_secret: bytes,
         channel_params: QuantumChannelParams | None = None,
+        peer_lookup: Callable[[str], tuple[str, int] | None] | None = None,
     ) -> None:
         if not node_id or not isinstance(node_id, str):
             raise ValueError("node_id must be a non-empty string")
@@ -172,6 +173,7 @@ class BB84ProtocolEngine:
         self.node_id = node_id
         self.auth_secret = bytes(auth_secret)
         self.channel_params = channel_params or QuantumChannelParams()
+        self.peer_lookup = peer_lookup
         self._server_socket: socket.socket | None = None
         self._responder_thread: threading.Thread | None = None
         self._stop_event = threading.Event()
@@ -180,6 +182,22 @@ class BB84ProtocolEngine:
     @property
     def bound_port(self) -> int:
         return self._bound_port
+
+    @staticmethod
+    def _proxy_stream(src: socket.socket, dst: socket.socket) -> None:
+        try:
+            while True:
+                chunk = src.recv(16384)
+                if not chunk:
+                    break
+                dst.sendall(chunk)
+        except Exception:
+            pass
+        finally:
+            try:
+                dst.shutdown(socket.SHUT_WR)
+            except Exception:
+                pass
 
     def pack_authenticated_frame(
         self,
@@ -360,9 +378,8 @@ class BB84ProtocolEngine:
         alice_bases = [(raw_bases_int >> i) & 1 for i in range(n)]
 
         connect_host = "127.0.0.1" if peer_host.strip() in ("0.0.0.0", "::", "") else peer_host.strip()
-        with socket.create_connection((connect_host, peer_port), timeout=timeout) as sock:
+        with socket.create_connection((connect_host, peer_port), timeout=min(float(timeout), 1.5)) as sock:
             sock.settimeout(timeout)
-
             # Step 1: Send QKD_INIT
             self._send_frame(
                 sock,
@@ -582,12 +599,120 @@ class BB84ProtocolEngine:
                 key_rate_bps=key_rate_bps,
             )
 
+    def negotiate_nat_relayed_session(
+        self,
+        peer_node: str,
+        epoch: int,
+        rtt_ms: float = 25.0,
+        override_params: QuantumChannelParams | None = None,
+    ) -> BB84SessionResult:
+        """Execute BB84 sifting, QBER estimation, Cascade reconciliation, and privacy amplification when peer is behind TCP NAT."""
+        start_ts = time.perf_counter()
+        params = override_params or self.channel_params
+        pair_key = ":".join(sorted([self.node_id, peer_node]))
+        seed_bytes = hashlib.sha256(
+            self.auth_secret + f":nat-bb84:{pair_key}:{epoch}".encode("utf-8")
+        ).digest()
+        session_id = f"bb84-{seed_bytes[:6].hex()}"
+        rng = random.Random(int.from_bytes(seed_bytes[:8], "big"))
+        n = params.pulse_count
+
+        alice_bits = [rng.getrandbits(1) for _ in range(n)]
+        alice_bases = [rng.getrandbits(1) for _ in range(n)]
+        bob_bases = [rng.getrandbits(1) for _ in range(n)]
+
+        transmitted_pulses = self.simulate_quantum_transmission(alice_bits, alice_bases, params)
+        transmitted_count = len(transmitted_pulses)
+
+        sifted_alice_bits: list[int] = []
+        sifted_bob_bits: list[int] = []
+        for pulse in transmitted_pulses:
+            idx = int(pulse["index"])
+            p_bit = int(pulse["bit"])
+            p_basis = int(pulse["basis"])
+            b_basis = bob_bases[idx]
+            m_bit = p_bit if p_basis == b_basis else rng.getrandbits(1)
+            if alice_bases[idx] == b_basis:
+                sifted_alice_bits.append(alice_bits[idx])
+                sifted_bob_bits.append(m_bit)
+
+        sifted_len = len(sifted_alice_bits)
+        if sifted_len < 64:
+            duration_ms = max(1.0, float(rtt_ms) * 2.0 + (time.perf_counter() - start_ts) * 1000.0)
+            return BB84SessionResult(
+                session_id=session_id,
+                peer_node=peer_node,
+                epoch=epoch,
+                raw_Exported_qubits=n,
+                transmitted_qubits=transmitted_count,
+                sifted_key_bits=sifted_len,
+                measured_qber=1.0,
+                corrected_errors=0,
+                final_key_bytes=None,
+                psk_fingerprint_sha256=None,
+                aborted=True,
+                abort_reason="INSUFFICIENT_SIFTED_BITS",
+                duration_ms=duration_ms,
+                key_rate_bps=0.0,
+            )
+
+        sample_count = max(16, min(sifted_len // 4, 128))
+        sample_positions = sorted(rng.sample(range(sifted_len), sample_count))
+        sample_set = set(sample_positions)
+        sample_errors = sum(1 for pos in sample_positions if sifted_alice_bits[pos] != sifted_bob_bits[pos])
+        measured_qber = sample_errors / float(sample_count)
+
+        remaining_alice = [b for i, b in enumerate(sifted_alice_bits) if i not in sample_set]
+        remaining_bob = [b for i, b in enumerate(sifted_bob_bits) if i not in sample_set]
+
+        if measured_qber > params.qber_abort_threshold:
+            duration_ms = max(1.0, float(rtt_ms) * 2.0 + (time.perf_counter() - start_ts) * 1000.0)
+            return BB84SessionResult(
+                session_id=session_id,
+                peer_node=peer_node,
+                epoch=epoch,
+                raw_Exported_qubits=n,
+                transmitted_qubits=transmitted_count,
+                sifted_key_bits=sifted_len,
+                measured_qber=measured_qber,
+                corrected_errors=0,
+                final_key_bytes=None,
+                psk_fingerprint_sha256=None,
+                aborted=True,
+                abort_reason=f"QBER_THRESHOLD_EXCEEDED ({measured_qber:.4f} > {params.qber_abort_threshold:.4f})",
+                duration_ms=duration_ms,
+                key_rate_bps=0.0,
+            )
+        _reconciled_bob, corrected_errors, _leaked = _reconcile_cascade_two_pass(
+            remaining_alice,
+            remaining_bob,
+            session_id,
+        )
+        final_key, psk_fingerprint = self._derive_wireguard_psk(remaining_alice, session_id, epoch)
+        duration_ms = max(1.0, float(rtt_ms) * 2.0 + (time.perf_counter() - start_ts) * 1000.0)
+        key_rate_bps = (len(final_key) * 8.0) / (duration_ms / 1000.0)
+        return BB84SessionResult(
+            session_id=session_id,
+            peer_node=peer_node,
+            epoch=epoch,
+            raw_Exported_qubits=n,
+            transmitted_qubits=transmitted_count,
+            sifted_key_bits=sifted_len,
+            measured_qber=measured_qber,
+            corrected_errors=corrected_errors,
+            final_key_bytes=final_key,
+            psk_fingerprint_sha256=psk_fingerprint,
+            aborted=False,
+            abort_reason=None,
+            duration_ms=duration_ms,
+            key_rate_bps=key_rate_bps,
+        )
     def run_server_once(
         self,
         sock: socket.socket,
         on_key_established: Callable[[BB84SessionResult], None] | None = None,
     ) -> BB84SessionResult:
-        """Act as Bob (Responder) for a single incoming BB84 TCP connection."""
+        """Act as Bob (Responder) or Trusted QKD Relay for a single incoming BB84 TCP connection."""
         start_ts = time.perf_counter()
         init_frame = self._recv_frame(sock)
         if init_frame["msg_type"] != "QKD_INIT":
@@ -596,11 +721,42 @@ class BB84ProtocolEngine:
         session_id = str(init_frame["session_id"])
         init_payload = init_frame["payload"]
         peer_node = str(init_payload.get("initiator_node", init_frame.get("sender_node", "unknown")))
+        target_peer = str(init_payload.get("peer_node", self.node_id))
         epoch = int(init_payload.get("epoch", 1))
         params = QuantumChannelParams.from_dict(init_payload.get("channel_params", {}))
         n = params.pulse_count
 
-        # Receive QUANTUM_BURST
+        if target_peer != self.node_id and self.peer_lookup is not None:
+            forward_addr = self.peer_lookup(target_peer)
+            if forward_addr is not None and forward_addr[1] > 0:
+                fwd_host = "127.0.0.1" if forward_addr[0].strip() in ("0.0.0.0", "::", "") else forward_addr[0].strip()
+                with socket.create_connection((fwd_host, forward_addr[1]), timeout=1.5) as dst_sock:
+                    dst_sock.settimeout(3.0)
+                    raw_init_body = json.dumps(init_frame, separators=(",", ":")).encode("utf-8")
+                    dst_sock.sendall(struct.pack("!I", len(raw_init_body)) + raw_init_body)
+                    t1 = threading.Thread(target=self._proxy_stream, args=(sock, dst_sock), daemon=True)
+                    t2 = threading.Thread(target=self._proxy_stream, args=(dst_sock, sock), daemon=True)
+                    t1.start()
+                    t2.start()
+                    t1.join(timeout=5.0)
+                    t2.join(timeout=5.0)
+                duration_ms = max(0.05, (time.perf_counter() - start_ts) * 1000.0)
+                return BB84SessionResult(
+                    session_id=session_id,
+                    peer_node=peer_node,
+                    epoch=epoch,
+                    raw_Exported_qubits=n,
+                    transmitted_qubits=0,
+                    sifted_key_bits=0,
+                    measured_qber=0.0,
+                    corrected_errors=0,
+                    final_key_bytes=None,
+                    psk_fingerprint_sha256=None,
+                    aborted=False,
+                    abort_reason="RELAY_PROXIED",
+                    duration_ms=duration_ms,
+                    key_rate_bps=0.0,
+                )
         burst_frame = self._recv_frame(sock)
         if burst_frame["msg_type"] != "QUANTUM_BURST":
             raise ValueError(f"Expected QUANTUM_BURST frame, got {burst_frame['msg_type']}")

@@ -14,7 +14,8 @@ param(
     [int]$Port = 8080,
     [string]$SubnetPrefix = "10.200.0.",
     [string]$BootstrapToken = "",
-    [switch]$NonInteractive
+    [switch]$NonInteractive,
+    [switch]$NoStart
 )
 
 $ErrorActionPreference = "Stop"
@@ -27,14 +28,14 @@ try {
     $IsAdmin = $false
 }
 
-if (-not $PSBoundParameters.ContainsKey("Prefix") -or [string]::IsNullOrWhiteSpace($Prefix)) {
-    if ($IsAdmin) {
-        $Prefix = "$env:ProgramData\qkd-sdwan-controller"
-    } else {
-        $Prefix = "$env:LOCALAPPDATA\qkd-sdwan-controller"
-    }
+if ($IsAdmin) {
+    $DefaultPrefix = "$env:ProgramData\qkd-sdwan-controller"
+} else {
+    $DefaultPrefix = "$env:LOCALAPPDATA\qkd-sdwan-controller"
 }
-
+if (-not $PSBoundParameters.ContainsKey("Prefix") -or [string]::IsNullOrWhiteSpace($Prefix)) {
+    $Prefix = $DefaultPrefix
+}
 $HasExplicitConfigFlags = (
     $PSBoundParameters.ContainsKey("Prefix") -or
     $PSBoundParameters.ContainsKey("BindHost") -or
@@ -155,7 +156,12 @@ if ($PyzSrc -and (Test-Path $PyzSrc)) {
 Write-Host "[3/4] Generating cluster HMAC secret, bootstrap Join Token, and controller.json..." -ForegroundColor Yellow
 $ConfigPath = "$Prefix\etc\controller.json"
 $env:PYTHONPATH = "$PyzDest;$RepoRoot;$env:PYTHONPATH"
-
+if (Test-Path "$Prefix\bin\qkd-sdwan-controller.bat") {
+    $PrevErr = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    & "$Prefix\bin\qkd-sdwan-controller.bat" stop 2>$null | Out-Null
+    $ErrorActionPreference = $PrevErr
+}
 $InitArgs = @(
     "-m", "qkd_sdwan.controller.cli", "init-config",
     "--output", "$ConfigPath",
@@ -183,13 +189,15 @@ $BatchContent = "@echo off`r`n" +
 [System.IO.File]::WriteAllText($BatchWrapper, $BatchContent, $Utf8NoBom)
 
 Copy-Item -Force $BatchWrapper "$Prefix\bin\qkd-sdwan-ctl.bat"
+Copy-Item -Force $BatchWrapper "$Prefix\bin\qkd-ctl.bat"
 
 $Ps1Wrapper = "$Prefix\bin\qkd-sdwan-controller.ps1"
 $Ps1Content = "`$env:PYTHONPATH = `"$PyzDest;$RepoRoot;`$env:PYTHONPATH`"`r`n" +
     "`$env:QKD_SDWAN_CONTROLLER_CONFIG = `"$ConfigPath`"`r`n" +
     "& `"$PythonExe`" -m qkd_sdwan.controller.cli --config `"$ConfigPath`" @args`r`n"
 [System.IO.File]::WriteAllText($Ps1Wrapper, $Ps1Content, $Utf8NoBom)
-
+Copy-Item -Force $Ps1Wrapper "$Prefix\bin\qkd-sdwan-ctl.ps1"
+Copy-Item -Force $Ps1Wrapper "$Prefix\bin\qkd-ctl.ps1"
 $TaskScript = "$Prefix\register-windows-service.ps1"
 $TaskContent = "# Run as Administrator to register startup task`r`n" +
     "schtasks.exe /Create /TN `"QKD-SDWAN-Controller`" /TR `"`"$BatchWrapper`" serve`" /SC ONSTART /RU `"SYSTEM`" /F`r`n" +
@@ -216,11 +224,18 @@ if ($IsAdmin) {
     $ErrorActionPreference = $PrevErr
 }
 
+if (($Prefix -eq $DefaultPrefix) -and (-not $NoStart)) {
+    $PrevErr = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    & $BatchWrapper serve --daemon
+    $ErrorActionPreference = $PrevErr
+}
+
 Write-Host "`n[OK] QKD-SDWAN Central Controller installed successfully on Windows:" -ForegroundColor Green
 Write-Host "     Configuration       : $ConfigPath"
 Write-Host "     Portable Bundle     : $PyzDest"
-Write-Host "     Batch CLI Wrapper   : $BatchWrapper"
-Write-Host "     PowerShell Wrapper  : $Ps1Wrapper"
+Write-Host "     Global CLI Commands : qkd-ctl | qkd-sdwan-controller"
 Write-Host "     Bootstrap Join Token: $BootstrapTokenActual"
-Write-Host "     Start Server Cmd    : & `"$BatchWrapper`" serve --dashboard"
-Write-Host "     Dashboard Snapshot  : & `"$BatchWrapper`" dashboard --once"
+Write-Host "     Start Background Cmd: qkd-ctl up"
+Write-Host "     Stop Background Cmd : qkd-ctl down"
+Write-Host "     Dashboard Snapshot  : qkd-ctl dashboard --once"

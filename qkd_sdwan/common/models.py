@@ -17,6 +17,7 @@ class LinkStatus(str, Enum):
     DEGRADED_UNDERLAY = "DEGRADED_UNDERLAY"
     EAVESDROPPING_SUSPECTED = "EAVESDROPPING_SUSPECTED"
     COMPROMISED_BLOCKED = "COMPROMISED_BLOCKED"
+    OFFLINE_DOWN = "OFFLINE_DOWN"
 
 
 class RouteMode(str, Enum):
@@ -86,9 +87,12 @@ class NodeRegistration:
     wg_public_key: str
     auth_token_id: str
     registered_at: float
+    lan_host: str | None = None
+    status: str = "ONLINE"
+    last_seen: float = 0.0
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        out: dict[str, Any] = {
             "node_id": self.node_id,
             "overlay_ip": self.overlay_ip,
             "underlay_host": self.underlay_host,
@@ -97,11 +101,26 @@ class NodeRegistration:
             "wg_public_key": self.wg_public_key,
             "auth_token_id": self.auth_token_id,
             "registered_at": self.registered_at,
+            "status": self.status,
+            "last_seen": self.last_seen if self.last_seen > 0.0 else self.registered_at,
         }
+        if self.lan_host:
+            out["lan_host"] = self.lan_host
+        return out
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "NodeRegistration":
         cls_name = cls.__name__
+        raw_lan = data.get("lan_host")
+        lan_host = str(raw_lan).strip() if isinstance(raw_lan, str) and raw_lan.strip() else None
+        reg_at = _coerce_float(cls_name, data, "registered_at")
+        raw_status = str(data.get("status", "ONLINE") or "ONLINE").strip().upper()
+        status = raw_status if raw_status in ("ONLINE", "OFFLINE") else "ONLINE"
+        raw_last_seen = data.get("last_seen")
+        try:
+            last_seen = float(raw_last_seen) if raw_last_seen is not None else reg_at
+        except (TypeError, ValueError):
+            last_seen = reg_at
         return cls(
             node_id=_coerce_str(cls_name, data, "node_id"),
             overlay_ip=_coerce_str(cls_name, data, "overlay_ip"),
@@ -110,9 +129,11 @@ class NodeRegistration:
             qkd_port=_coerce_int(cls_name, data, "qkd_port"),
             wg_public_key=_coerce_str(cls_name, data, "wg_public_key"),
             auth_token_id=_coerce_str(cls_name, data, "auth_token_id"),
-            registered_at=_coerce_float(cls_name, data, "registered_at"),
+            registered_at=reg_at,
+            lan_host=lan_host,
+            status=status,
+            last_seen=last_seen if last_seen > 0.0 else reg_at,
         )
-
 
 @dataclass
 class LinkTelemetry:
@@ -280,6 +301,27 @@ class BB84SessionResult:
             "duration_ms": self.duration_ms,
             "key_rate_bps": self.key_rate_bps,
         }
+
+    @classmethod
+    def from_summary_dict(cls, data: dict[str, Any]) -> "BB84SessionResult":
+        cls_name = cls.__name__
+        raw_qubits = data.get("raw_Exported_qubits", data.get("raw_exported_qubits", 0))
+        return cls(
+            session_id=_coerce_str(cls_name, data, "session_id"),
+            peer_node=_coerce_str(cls_name, data, "peer_node"),
+            epoch=_coerce_int(cls_name, data, "epoch"),
+            raw_Exported_qubits=int(raw_qubits),
+            transmitted_qubits=_coerce_int(cls_name, data, "transmitted_qubits"),
+            sifted_key_bits=_coerce_int(cls_name, data, "sifted_key_bits"),
+            measured_qber=_coerce_float(cls_name, data, "measured_qber"),
+            corrected_errors=_coerce_int(cls_name, data, "corrected_errors"),
+            final_key_bytes=None,
+            psk_fingerprint_sha256=str(data["psk_fingerprint_sha256"]) if data.get("psk_fingerprint_sha256") else None,
+            aborted=_coerce_bool(cls_name, data, "aborted"),
+            abort_reason=str(data["abort_reason"]) if data.get("abort_reason") else None,
+            duration_ms=_coerce_float(cls_name, data, "duration_ms"),
+            key_rate_bps=_coerce_float(cls_name, data, "key_rate_bps"),
+        )
 
 
 @dataclass

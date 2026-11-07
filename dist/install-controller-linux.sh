@@ -2,17 +2,18 @@
 # Cross-Platform Linux CLI Installer for QKD-SDWAN Central Controller
 set -euo pipefail
 
-PREFIX="/opt/qkd-sdwan-controller"
+DEFAULT_PREFIX="/opt/qkd-sdwan-controller"
 if [[ "$(id -u)" -ne 0 ]]; then
-  PREFIX="${HOME}/.local/share/qkd-sdwan-controller"
+  DEFAULT_PREFIX="${HOME}/.local/share/qkd-sdwan-controller"
 fi
+PREFIX="${DEFAULT_PREFIX}"
 HOST="0.0.0.0"
 PORT="8080"
 SUBNET_PREFIX="10.200.0."
 BOOTSTRAP_TOKEN=""
 NON_INTERACTIVE=0
 EXPLICIT_FLAGS=0
-
+NO_START=0
 usage() {
   cat <<EOF
 Usage: $0 [OPTIONS]
@@ -26,6 +27,7 @@ Options:
   --subnet-prefix <prefix>   Overlay IPv4 /24 prefix (default: ${SUBNET_PREFIX})
   --bootstrap-token <token>  Initial Join Token for client auto-enrollment (auto-generated if omitted)
   --non-interactive          Run unattended without interactive CLI prompts
+  --no-start                 Do not auto-start the background Controller daemon after installation
   -h, --help                 Show this help message
 EOF
 }
@@ -59,6 +61,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --non-interactive)
       NON_INTERACTIVE=1
+      shift
+      ;;
+    --no-start)
+      NO_START=1
       shift
       ;;
     -h|--help)
@@ -137,7 +143,7 @@ TOKEN_INFO="$("${PYTHON_BIN}" -m qkd_sdwan.controller.cli init-config \
   --bootstrap-token "${BOOTSTRAP_TOKEN}")"
 chmod 600 "${CONFIG_PATH}"
 
-echo "[4/4] Installing CLI wrappers (qkd-sdwan-controller, qkd-sdwan-ctl) and systemd service..."
+echo "[4/4] Installing CLI wrappers (qkd-ctl, qkd-sdwan-controller, qkd-sdwan-ctl) and systemd service..."
 CONTROLLER_BIN="${PREFIX}/bin/qkd-sdwan-controller"
 cat > "${CONTROLLER_BIN}" <<EOF
 #!/usr/bin/env bash
@@ -149,14 +155,12 @@ EOF
 chmod +x "${CONTROLLER_BIN}"
 
 CTL_BIN="${PREFIX}/bin/qkd-sdwan-ctl"
-cat > "${CTL_BIN}" <<EOF
-#!/usr/bin/env bash
-set -euo pipefail
-export PYTHONPATH="${PYZ_DEST}:${REPO_ROOT}:\${PYTHONPATH:-}"
-export QKD_SDWAN_CONTROLLER_CONFIG="${CONFIG_PATH}"
-exec "${PYTHON_BIN}" -m qkd_sdwan.controller.cli --config "${CONFIG_PATH}" "\$@"
-EOF
+cp -f "${CONTROLLER_BIN}" "${CTL_BIN}"
 chmod +x "${CTL_BIN}"
+
+SHORT_CTL_BIN="${PREFIX}/bin/qkd-ctl"
+cp -f "${CONTROLLER_BIN}" "${SHORT_CTL_BIN}"
+chmod +x "${SHORT_CTL_BIN}"
 
 SERVICE_PATH="${PREFIX}/qkd-sdwan-controller.service"
 cat > "${SERVICE_PATH}" <<EOF
@@ -175,9 +179,27 @@ RestartSec=3
 WantedBy=multi-user.target
 EOF
 
+if [[ "${PREFIX}" == "${DEFAULT_PREFIX}" ]]; then
+  USER_BIN_DIR="${HOME}/.local/bin"
+  mkdir -p "${USER_BIN_DIR}"
+  ln -sf "${SHORT_CTL_BIN}" "${USER_BIN_DIR}/qkd-ctl"
+  ln -sf "${CTL_BIN}" "${USER_BIN_DIR}/qkd-sdwan-ctl"
+  ln -sf "${CONTROLLER_BIN}" "${USER_BIN_DIR}/qkd-sdwan-controller"
+  if [[ "$(id -u)" -eq 0 && -d "/usr/local/bin" ]]; then
+    ln -sf "${SHORT_CTL_BIN}" "/usr/local/bin/qkd-ctl"
+    ln -sf "${CTL_BIN}" "/usr/local/bin/qkd-sdwan-ctl"
+    ln -sf "${CONTROLLER_BIN}" "/usr/local/bin/qkd-sdwan-controller"
+  fi
+  if [[ "${NO_START}" -eq 0 ]]; then
+    "${CONTROLLER_BIN}" stop >/dev/null 2>&1 || true
+    "${CONTROLLER_BIN}" serve --daemon || true
+  fi
+fi
+
 echo "[OK] QKD-SDWAN Central Controller installed successfully:"
 echo "     Configuration       : ${CONFIG_PATH}"
 echo "     Portable Bundle     : ${PYZ_DEST}"
-echo "     Controller CLI      : ${CONTROLLER_BIN}"
-echo "     Dashboard Command   : ${CONTROLLER_BIN} dashboard --controller-url http://127.0.0.1:${PORT}"
+echo "     Controller CLI      : qkd-ctl | ${CONTROLLER_BIN}"
+echo "     Start Daemon Cmd    : qkd-ctl up"
+echo "     Dashboard Command   : qkd-ctl dashboard"
 echo "     Bootstrap Join Token: ${TOKEN_INFO}"

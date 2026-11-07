@@ -2,13 +2,16 @@
 # Cross-Platform Linux CLI Installer for QKD-SDWAN Endpoint Client
 set -euo pipefail
 
-PREFIX="/etc/qkd-sdwan"
+DEFAULT_PREFIX="/etc/qkd-sdwan"
 if [[ "$(id -u)" -ne 0 ]]; then
-  PREFIX="${HOME}/.local/share/qkd-sdwan-client"
+  DEFAULT_PREFIX="${HOME}/.local/share/qkd-sdwan-client"
 fi
-NODE_ID="edge-node-01"
+PREFIX="${DEFAULT_PREFIX}"
+RAW_HOST="$(hostname -s 2>/dev/null || hostname 2>/dev/null || echo node-01)"
+CLEAN_HOST="$(echo "${RAW_HOST}" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9-')"
+NODE_ID="edge-${CLEAN_HOST:-node-01}"
 OVERLAY_IP="10.200.0.10"
-CONTROLLER_URL="http://127.0.0.1:8080"
+CONTROLLER_URL="http://192.168.1.2:8080"
 JOIN_TOKEN=""
 WG_PORT="51820"
 QKD_PORT="52820"
@@ -16,7 +19,7 @@ INTERFACE_NAME="wg-qkd0"
 NON_INTERACTIVE=0
 EXPLICIT_FLAGS=0
 EXPLICIT_IP=0
-
+NO_START=0
 usage() {
   cat <<EOF
 Usage: $(basename "$0") [OPTIONS]
@@ -33,6 +36,7 @@ Options:
   --qkd-port <port>        BB84 QKD TCP socket port (default: ${QKD_PORT})
   --interface <name>       WireGuard interface name (default: ${INTERFACE_NAME})
   --non-interactive        Run unattended without interactive CLI prompts
+  --no-start               Do not auto-start the background Client daemon after installation
   -h, --help               Show this help message
 EOF
 }
@@ -82,6 +86,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --non-interactive)
       NON_INTERACTIVE=1
+      shift
+      ;;
+    --no-start)
+      NO_START=1
       shift
       ;;
     -h|--help)
@@ -185,7 +193,7 @@ fi
   "${INIT_EXTRA_ARGS[@]}"
 chmod 600 "${CONFIG_PATH}"
 
-echo "[4/4] Installing CLI wrappers (qkd-sdwan-client, qkd-sdwan-agent) and systemd service..."
+echo "[4/4] Installing CLI wrappers (qkd, qkd-sdwan, qkd-sdwan-client, qkd-sdwan-agent) and systemd service..."
 CLIENT_BIN="${PREFIX}/bin/qkd-sdwan-client"
 cat > "${CLIENT_BIN}" <<EOF
 #!/usr/bin/env bash
@@ -197,14 +205,16 @@ EOF
 chmod +x "${CLIENT_BIN}"
 
 AGENT_BIN="${PREFIX}/bin/qkd-sdwan-agent"
-cat > "${AGENT_BIN}" <<EOF
-#!/usr/bin/env bash
-set -euo pipefail
-export PYTHONPATH="${PYZ_DEST}:${REPO_ROOT}:\${PYTHONPATH:-}"
-export QKD_SDWAN_CLIENT_CONFIG="${CONFIG_PATH}"
-exec "${PYTHON_BIN}" -m qkd_sdwan.client.agent --config "${CONFIG_PATH}" "\$@"
-EOF
+cp -f "${CLIENT_BIN}" "${AGENT_BIN}"
 chmod +x "${AGENT_BIN}"
+
+QKD_SDWAN_BIN="${PREFIX}/bin/qkd-sdwan"
+cp -f "${CLIENT_BIN}" "${QKD_SDWAN_BIN}"
+chmod +x "${QKD_SDWAN_BIN}"
+
+QKD_BIN="${PREFIX}/bin/qkd"
+cp -f "${CLIENT_BIN}" "${QKD_BIN}"
+chmod +x "${QKD_BIN}"
 
 SERVICE_PATH="${PREFIX}/qkd-sdwan-client.service"
 cat > "${SERVICE_PATH}" <<EOF
@@ -216,7 +226,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 Environment="PYTHONPATH=${PYZ_DEST}:${REPO_ROOT}"
-ExecStart=${CLIENT_BIN} --config ${CONFIG_PATH}
+ExecStart=${CLIENT_BIN} --config ${CONFIG_PATH} serve
 Restart=on-failure
 RestartSec=5
 NoNewPrivileges=true
@@ -225,9 +235,30 @@ NoNewPrivileges=true
 WantedBy=multi-user.target
 EOF
 
+if [[ "${PREFIX}" == "${DEFAULT_PREFIX}" ]]; then
+  USER_BIN_DIR="${HOME}/.local/bin"
+  mkdir -p "${USER_BIN_DIR}"
+  ln -sf "${QKD_BIN}" "${USER_BIN_DIR}/qkd"
+  ln -sf "${QKD_SDWAN_BIN}" "${USER_BIN_DIR}/qkd-sdwan"
+  ln -sf "${CLIENT_BIN}" "${USER_BIN_DIR}/qkd-sdwan-client"
+  ln -sf "${AGENT_BIN}" "${USER_BIN_DIR}/qkd-sdwan-agent"
+  if [[ "$(id -u)" -eq 0 && -d "/usr/local/bin" ]]; then
+    ln -sf "${QKD_BIN}" "/usr/local/bin/qkd"
+    ln -sf "${QKD_SDWAN_BIN}" "/usr/local/bin/qkd-sdwan"
+    ln -sf "${CLIENT_BIN}" "/usr/local/bin/qkd-sdwan-client"
+    ln -sf "${AGENT_BIN}" "/usr/local/bin/qkd-sdwan-agent"
+  fi
+  if [[ "${NO_START}" -eq 0 ]]; then
+    "${CLIENT_BIN}" stop >/dev/null 2>&1 || true
+    "${CLIENT_BIN}" serve --daemon || true
+  fi
+fi
+
 echo "[OK] QKD-SDWAN Endpoint Client installed successfully:"
 echo "     Configuration : ${CONFIG_PATH}"
 echo "     Portable Bundle: ${PYZ_DEST}"
-echo "     Client CLI    : ${CLIENT_BIN}"
-echo "     Agent Wrapper : ${AGENT_BIN}"
+echo "     Global CLI    : qkd | qkd-sdwan | ${CLIENT_BIN}"
+echo "     Start Daemon  : qkd up"
+echo "     Stop Daemon   : qkd down"
+echo "     Interactive UI: qkd"
 echo "     Systemd Unit  : ${SERVICE_PATH}"

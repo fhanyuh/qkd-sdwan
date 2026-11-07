@@ -133,16 +133,15 @@ class IsolationForestDetector:
         baseline_pool: list[list[float]] = []
 
         for _ in range(pool_size):
-            qber = rng.uniform(0.01, 0.035)
-            qber_delta = rng.uniform(-0.008, 0.008)
-            key_rate_bps = rng.uniform(3500.0, 9000.0)
-            latency_ms = rng.uniform(3.0, 28.0)
-            jitter_ms = rng.uniform(0.2, 4.5)
-            packet_loss_pct = rng.uniform(0.0, 0.8)
+            qber = rng.uniform(0.005, 0.038)
+            qber_delta = rng.uniform(-0.012, 0.012)
+            key_rate_bps = rng.uniform(400.0, 25000.0)
+            latency_ms = rng.uniform(0.1, 65.0)
+            jitter_ms = rng.uniform(0.0, 12.0)
+            packet_loss_pct = rng.uniform(0.0, 1.0)
             baseline_pool.append(
                 [qber, qber_delta, key_rate_bps, latency_ms, jitter_ms, packet_loss_pct]
             )
-
         n_dims = 6
         self._feature_means = [
             statistics.fmean(row[d] for row in baseline_pool) for d in range(n_dims)
@@ -192,6 +191,18 @@ class IsolationForestDetector:
         anomaly_score = round(min(0.99, max(0.05, if_score * 0.78 + z_boost)), 4)
 
         # Classification rules per architectural specification
+        if (
+            telemetry.packet_loss_pct >= 100.0
+            and telemetry.throughput_mbps <= 0.0
+            and telemetry.key_rate_bps <= 0.0
+            and telemetry.qber <= 0.0
+        ):
+            return (
+                0.99,
+                LinkStatus.OFFLINE_DOWN,
+                f"Peer endpoint unreachable / service offline (loss={telemetry.packet_loss_pct:.0f}%, key_rate=0 bps)",
+            )
+
         if telemetry.qber > 0.11 or telemetry.qkd_abort_count > 0:
             status = LinkStatus.COMPROMISED_BLOCKED
             reason = (
@@ -207,9 +218,9 @@ class IsolationForestDetector:
         elif (
             telemetry.qber < 0.065
             and (
-                anomaly_score >= 0.62
-                or telemetry.packet_loss_pct > 3.0
+                telemetry.packet_loss_pct > 3.0
                 or telemetry.latency_ms > 80.0
+                or telemetry.jitter_ms > 20.0
             )
         ):
             status = LinkStatus.DEGRADED_UNDERLAY
@@ -241,9 +252,8 @@ class OverlayRouteOptimizer:
         status: LinkStatus,
     ) -> float:
         """Compute multi-objective link cost for a directed P2P edge (u, v)."""
-        if status == LinkStatus.COMPROMISED_BLOCKED:
+        if status in (LinkStatus.COMPROMISED_BLOCKED, LinkStatus.OFFLINE_DOWN):
             return 1e6
-
         cost = (
             1.0 * telemetry.latency_ms
             + 2.5 * telemetry.jitter_ms
@@ -280,6 +290,22 @@ class OverlayRouteOptimizer:
 
             target_reg = nodes.get(v)
             direct_endpoint = f"{target_reg.underlay_host}:{target_reg.wg_port}" if target_reg else "127.0.0.1:0"
+            if target_reg is not None and target_reg.status == "OFFLINE":
+                directives.append(
+                    RouteDirective(
+                        source_node=u,
+                        target_node=v,
+                        route_mode=RouteMode.QUARANTINED,
+                        next_hop_node="",
+                        next_hop_endpoint="",
+                        anomaly_score=0.99,
+                        link_status=LinkStatus.OFFLINE_DOWN,
+                        force_rekey=False,
+                        reason=f"Target peer {v} is OFFLINE (service stopped or heartbeat timed out)",
+                        updated_at=now,
+                    )
+                )
+                continue
             direct_cost = self.compute_link_cost(telemetry, anomaly_score, status)
 
             # Priority 1: Keep direct P2P communication whenever link is HEALTHY
@@ -309,6 +335,9 @@ class OverlayRouteOptimizer:
             }
             for w in sorted(candidate_nodes):
                 if w in (u, v):
+                    continue
+                cand_reg = nodes.get(w)
+                if cand_reg is not None and cand_reg.status == "OFFLINE":
                     continue
                 edge_uw = self._lookup_edge(u, w, link_metrics)
                 edge_wv = self._lookup_edge(w, v, link_metrics)
@@ -369,6 +398,21 @@ class OverlayRouteOptimizer:
                         link_status=status,
                         force_rekey=True,
                         reason="Direct quantum channel compromised and no healthy P2P relay available",
+                        updated_at=now,
+                    )
+                )
+            elif status == LinkStatus.OFFLINE_DOWN:
+                directives.append(
+                    RouteDirective(
+                        source_node=u,
+                        target_node=v,
+                        route_mode=RouteMode.QUARANTINED,
+                        next_hop_node="",
+                        next_hop_endpoint="",
+                        anomaly_score=anomaly_score,
+                        link_status=status,
+                        force_rekey=False,
+                        reason=f"Target peer {v} unreachable (OFFLINE_DOWN) and no healthy P2P relay available",
                         updated_at=now,
                     )
                 )

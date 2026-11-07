@@ -10,13 +10,14 @@ Join Token auto-enrollment, and Windows scheduled task launcher).
 [CmdletBinding()]
 param(
     [string]$Prefix = "",
-    [string]$NodeId = "edge-node-01",
+    [string]$NodeId = "auto",
     [string]$OverlayIp = "10.200.0.10",
-    [string]$ControllerUrl = "http://127.0.0.1:8080",
+    [string]$ControllerUrl = "http://192.168.1.2:8080",
     [string]$JoinToken = "",
     [int]$WgPort = 51820,
     [int]$QkdPort = 52820,
-    [switch]$NonInteractive
+    [switch]$NonInteractive,
+    [switch]$NoStart
 )
 
 $ErrorActionPreference = "Stop"
@@ -29,14 +30,22 @@ try {
     $IsAdmin = $false
 }
 
+if ($IsAdmin) {
+    $DefaultPrefix = "$env:ProgramData\qkd-sdwan-client"
+} else {
+    $DefaultPrefix = "$env:LOCALAPPDATA\qkd-sdwan-client"
+}
 if (-not $PSBoundParameters.ContainsKey("Prefix") -or [string]::IsNullOrWhiteSpace($Prefix)) {
-    if ($IsAdmin) {
-        $Prefix = "$env:ProgramData\qkd-sdwan-client"
+    $Prefix = $DefaultPrefix
+}
+if ([string]::IsNullOrWhiteSpace($NodeId) -or $NodeId -eq "auto" -or $NodeId -eq "edge-node-01") {
+    if ($env:COMPUTERNAME) {
+        $CleanHost = ($env:COMPUTERNAME.ToLower() -replace "[^a-z0-9-]", "-")
+        $NodeId = "edge-$CleanHost"
     } else {
-        $Prefix = "$env:LOCALAPPDATA\qkd-sdwan-client"
+        $NodeId = "edge-node-01"
     }
 }
-
 $ExplicitIp = $PSBoundParameters.ContainsKey("OverlayIp")
 $HasExplicitConfigFlags = (
     $PSBoundParameters.ContainsKey("Prefix") -or
@@ -169,7 +178,12 @@ if ($PyzSrc -and (Test-Path $PyzSrc)) {
 Write-Host "[3/4] Generating WireGuard keypair and enrolling with Controller..." -ForegroundColor Yellow
 $ConfigPath = "$Prefix\etc\endpoint.json"
 $env:PYTHONPATH = "$PyzDest;$RepoRoot;$env:PYTHONPATH"
-
+if (Test-Path "$Prefix\bin\qkd-sdwan-client.bat") {
+    $PrevErr = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    & "$Prefix\bin\qkd-sdwan-client.bat" stop 2>$null | Out-Null
+    $ErrorActionPreference = $PrevErr
+}
 $InitArgs = @(
     "-m", "qkd_sdwan.client.agent", "init-config",
     "--output", "$ConfigPath",
@@ -202,16 +216,20 @@ $BatchContent = "@echo off`r`n" +
 [System.IO.File]::WriteAllText($BatchWrapper, $BatchContent, $Utf8NoBom)
 
 Copy-Item -Force $BatchWrapper "$Prefix\bin\qkd-sdwan-agent.bat"
+Copy-Item -Force $BatchWrapper "$Prefix\bin\qkd-sdwan.bat"
+Copy-Item -Force $BatchWrapper "$Prefix\bin\qkd.bat"
 
 $Ps1Wrapper = "$Prefix\bin\qkd-sdwan-client.ps1"
 $Ps1Content = "`$env:PYTHONPATH = `"$PyzDest;$RepoRoot;`$env:PYTHONPATH`"`r`n" +
     "`$env:QKD_SDWAN_CLIENT_CONFIG = `"$ConfigPath`"`r`n" +
     "& `"$PythonExe`" -m qkd_sdwan.client.agent --config `"$ConfigPath`" @args`r`n"
 [System.IO.File]::WriteAllText($Ps1Wrapper, $Ps1Content, $Utf8NoBom)
-
+Copy-Item -Force $Ps1Wrapper "$Prefix\bin\qkd-sdwan-agent.ps1"
+Copy-Item -Force $Ps1Wrapper "$Prefix\bin\qkd-sdwan.ps1"
+Copy-Item -Force $Ps1Wrapper "$Prefix\bin\qkd.ps1"
 $TaskScript = "$Prefix\register-windows-service.ps1"
 $TaskContent = "# Run as Administrator to register startup task`r`n" +
-    "schtasks.exe /Create /TN `"QKD-SDWAN-Client`" /TR `"`"$BatchWrapper`"`" /SC ONSTART /RU `"SYSTEM`" /F`r`n" +
+    "schtasks.exe /Create /TN `"QKD-SDWAN-Client`" /TR `"`"$BatchWrapper`" serve`" /SC ONSTART /RU `"SYSTEM`" /F`r`n" +
     "Write-Host `"[+] QKD-SDWAN Client registered as Windows ONSTART task`"`r`n"
 [System.IO.File]::WriteAllText($TaskScript, $TaskContent, $Utf8NoBom)
 
@@ -236,10 +254,18 @@ if ($IsAdmin) {
     $ErrorActionPreference = $PrevErr
 }
 
+if (($Prefix -eq $DefaultPrefix) -and (-not $NoStart)) {
+    $PrevErr = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    & $BatchWrapper serve --daemon
+    $ErrorActionPreference = $PrevErr
+}
+
 Write-Host "`n[OK] QKD-SDWAN Endpoint Client installed successfully on Windows:" -ForegroundColor Green
 Write-Host "     Configuration      : $ConfigPath"
 Write-Host "     Portable Bundle    : $PyzDest"
-Write-Host "     Batch CLI Wrapper  : $BatchWrapper"
-Write-Host "     PowerShell Wrapper : $Ps1Wrapper"
-Write-Host "     Interactive Console: & `"$BatchWrapper`" console"
-Write-Host "     Interactive Dash   : & `"$BatchWrapper`" dashboard"
+Write-Host "     Global CLI Commands: qkd | qkd-sdwan | qkd-sdwan-client"
+Write-Host "     Start Background   : qkd up"
+Write-Host "     Stop Background    : qkd down"
+Write-Host "     Interactive Console: qkd console"
+Write-Host "     Interactive Dash   : qkd"

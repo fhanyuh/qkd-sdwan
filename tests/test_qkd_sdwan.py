@@ -31,7 +31,7 @@ from qkd_sdwan.common.models import (
 )
 from qkd_sdwan.controller.cli import main as controller_cli_main, render_controller_dashboard
 from qkd_sdwan.controller.ml_engine import IsolationForestDetector, OverlayRouteOptimizer
-from qkd_sdwan.controller.server import SDWANControllerServer
+from qkd_sdwan.controller.server import SDWANControllerServer, _resolve_peer_underlay_host
 
 
 class TestQKDSDWANSuite(unittest.TestCase):
@@ -302,7 +302,11 @@ class TestQKDSDWANSuite(unittest.TestCase):
             # Scenario 3: Moderate eavesdropping (eta_eve = 0.30) -> EAVESDROPPING_SUSPECTED + RELAY_P2P
             s3 = agent_jkt.run_key_rotation_and_telemetry_cycle(
                 "edge-sby-03",
-                override_channel_params=QuantumChannelParams(eavesdrop_intercept_ratio=0.30),
+                override_channel_params=QuantumChannelParams(
+                    depolarization_prob=0.015,
+                    eavesdrop_intercept_ratio=0.28,
+                    pulse_count=4096,
+                ),
                 simulated_underlay={"latency_ms": 14.0, "jitter_ms": 1.2, "packet_loss_pct": 0.1},
             )
             self.assertEqual(s3["evaluation"]["link_status"], "EAVESDROPPING_SUSPECTED")
@@ -813,28 +817,55 @@ class TestQKDSDWANSuite(unittest.TestCase):
                 self.assertEqual(stat_json["node_id"], "edge-win-02")
                 self.assertEqual(stat_json["overlay_ip"], "10.200.0.11")
 
-                # 5. Verify full Linux installer end-to-end execution in temp prefix
+                # 5. Verify full platform installer end-to-end execution in temp prefix
                 linux_client_prefix = tmp_path / "installed-client"
-                subprocess.run(
-                    [
-                        "bash",
-                        str(dist_dir / "install-client-linux.sh"),
-                        "--non-interactive",
-                        "--prefix",
-                        str(linux_client_prefix),
-                        "--node-id",
-                        "edge-installed-linux",
-                        "--overlay-ip",
-                        "10.200.0.77",
-                        "--controller-url",
-                        controller.base_url,
-                    ],
-                    capture_output=True,
-                    text=True,
-                    check=True,
-                )
+                if os.name == "nt":
+                    subprocess.run(
+                        [
+                            "powershell",
+                            "-NoProfile",
+                            "-ExecutionPolicy",
+                            "Bypass",
+                            "-File",
+                            str(dist_dir / "install-client-windows.ps1"),
+                            "-NonInteractive",
+                            "-NoStart",
+                            "-Prefix",
+                            str(linux_client_prefix),
+                            "-NodeId",
+                            "edge-installed-linux",
+                            "-OverlayIp",
+                            "10.200.0.77",
+                            "-ControllerUrl",
+                            controller.base_url,
+                        ],
+                        capture_output=True,
+                        text=True,
+                        check=True,
+                    )
+                    wrapper_bin = linux_client_prefix / "bin" / "qkd-sdwan-client.bat"
+                else:
+                    subprocess.run(
+                        [
+                            "bash",
+                            str(dist_dir / "install-client-linux.sh"),
+                            "--non-interactive",
+                            "--no-start",
+                            "--prefix",
+                            str(linux_client_prefix),
+                            "--node-id",
+                            "edge-installed-linux",
+                            "--overlay-ip",
+                            "10.200.0.77",
+                            "--controller-url",
+                            controller.base_url,
+                        ],
+                        capture_output=True,
+                        text=True,
+                        check=True,
+                    )
+                    wrapper_bin = linux_client_prefix / "bin" / "qkd-sdwan-client"
                 self.assertIn("edge-installed-linux", controller.get_cluster_status()["nodes"])
-                wrapper_bin = linux_client_prefix / "bin" / "qkd-sdwan-client"
                 wrap_proc = subprocess.run(
                     [str(wrapper_bin), "dashboard", "--once", "--wg-port", "0", "--qkd-port", "0"],
                     capture_output=True,
@@ -859,6 +890,486 @@ class TestQKDSDWANSuite(unittest.TestCase):
                     self.assertIn("[System.Text.UTF8Encoding]::new($false)", text)
                     self.assertNotIn("python -c", text)
         finally:
+            controller.shutdown()
+
+    def test_production_daemon_ipc_wan_roaming_and_2node_e2e(self) -> None:
+        """Verify WAN IP discovery, WireGuard NAT roaming, and 3-process OS daemon E2E (Controller + 2 Clients)."""
+        # 1. Verify Public/WAN IP discovery & NAT gateway resolution
+        self.assertEqual(_resolve_peer_underlay_host("127.0.0.1", "203.0.113.45"), "203.0.113.45")
+        self.assertEqual(_resolve_peer_underlay_host("auto", "192.168.1.50"), "192.168.1.50")
+        # Private RFC1918 LAN IP reported from behind NAT when Controller observes public WAN IP -> use public WAN IP
+        self.assertEqual(_resolve_peer_underlay_host("192.168.1.25", "198.51.100.77"), "198.51.100.77")
+        # Explicit public IP or domain name is preserved
+        self.assertEqual(_resolve_peer_underlay_host("198.51.100.10", "198.51.100.77"), "198.51.100.10")
+        self.assertEqual(_resolve_peer_underlay_host("jkt-edge.example.com", "198.51.100.77"), "jkt-edge.example.com")
+
+        # 2. Verify WireGuard UDP keepalive and dynamic NAT endpoint roaming
+        wg_a = WireGuardTunnelDaemon("node-a", "wg0", "10.200.0.10", 0)
+        wg_b = WireGuardTunnelDaemon("node-b", "wg0", "10.200.0.11", 0)
+        try:
+            wg_a.register_peer("node-b", wg_b.public_key_b64, "10.200.0.11", f"127.0.0.1:{wg_b.bound_port}")
+            wg_b.register_peer("node-a", wg_a.public_key_b64, "10.200.0.10", "198.51.100.1:51820")
+            shared_psk = os.urandom(32)
+            wg_a.inject_preshared_key("node-b", wg_b.public_key_b64, shared_psk, epoch=1)
+            wg_b.inject_preshared_key("node-a", wg_a.public_key_b64, shared_psk, epoch=1)
+            self.assertEqual(wg_a.send_keepalive(), 1)
+
+            # Simulate an authenticated WG_DATA packet arriving at wg_b from an external NAT port 203.0.113.88:61422
+            from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
+
+            aead_key = wg_a._session_aead_keys["node-b"]
+            nonce = os.urandom(12)
+            aad = json.dumps({"psk_epoch": 1, "source_node": "node-a", "target_node": "node-b"}, sort_keys=True, separators=(",", ":")).encode("utf-8")
+            ct = ChaCha20Poly1305(aead_key).encrypt(nonce, b"QKD-SDWAN-P2P-PROBE", aad)
+            roam_msg = {
+                "type": "WG_DATA",
+                "packet_id": "roam-pkt-01",
+                "source_node": "node-a",
+                "target_node": "node-b",
+                "route_mode": "DIRECT_P2P",
+                "via_relay_node": None,
+                "final_endpoint": f"127.0.0.1:{wg_b.bound_port}",
+                "origin_endpoint": f"127.0.0.1:{wg_a.bound_port}",
+                "psk_epoch": 1,
+                "nonce_b64": base64.b64encode(nonce).decode("ascii"),
+                "aad_b64": base64.b64encode(aad).decode("ascii"),
+                "ciphertext_b64": base64.b64encode(ct).decode("ascii"),
+            }
+            raw_roam = json.dumps(roam_msg).encode("utf-8")
+            # Mock sendto only during the simulated external IP roaming check so we don't send to 203.0.113.88
+            orig_sock = wg_b._udp_sock
+            sent_targets: list[tuple[str, int]] = []
+
+            class _SendSpy:
+                def sendto(self, data: bytes, addr: tuple[str, int]) -> int:
+                    sent_targets.append(addr)
+                    return len(data)
+
+                def __getattr__(self, name: str) -> object:
+                    return getattr(orig_sock, name)
+
+            wg_b._udp_sock = _SendSpy()  # type: ignore[assignment]
+            try:
+                wg_b._handle_data_packet(roam_msg, raw_roam, ("203.0.113.88", 61422))
+            finally:
+                wg_b._udp_sock = orig_sock
+            peer_a_state = wg_b.get_peer_state("node-a")
+            self.assertIsNotNone(peer_a_state)
+            assert peer_a_state is not None
+            self.assertEqual(peer_a_state.underlay_endpoint, "203.0.113.88:61422")
+            self.assertEqual(sent_targets[-1], ("203.0.113.88", 61422))
+        finally:
+            wg_a.close()
+            wg_b.close()
+
+        # 3. Full 3-process OS daemon E2E verification (1 Controller Daemon + 2 Client Daemons)
+        repo_root = Path(__file__).resolve().parents[1]
+        dist_dir = repo_root / "dist"
+        with tempfile.TemporaryDirectory(prefix="qkd-prod-e2e-", ignore_cleanup_errors=True) as tmpdir:
+            tmp_path = Path(tmpdir)
+            ctrl_prefix = tmp_path / "ctrl"
+            jkt_prefix = tmp_path / "jkt"
+            sby_prefix = tmp_path / "sby"
+
+            # Find 3 free ports for Controller and 2 Clients
+            import socket as _sock
+
+            free_ports: list[int] = []
+            for _ in range(5):
+                with _sock.socket(_sock.AF_INET, _sock.SOCK_STREAM) as s:
+                    s.bind(("127.0.0.1", 0))
+                    free_ports.append(s.getsockname()[1])
+            ctrl_port, jkt_wg, jkt_qkd, sby_wg, sby_qkd = free_ports
+            ctrl_url = f"http://127.0.0.1:{ctrl_port}"
+
+            bin_ext = ".bat" if os.name == "nt" else ""
+            ctrl_bin = ctrl_prefix / "bin" / f"qkd-sdwan-controller{bin_ext}"
+            jkt_bin = jkt_prefix / "bin" / f"qkd-sdwan-client{bin_ext}"
+            sby_bin = sby_prefix / "bin" / f"qkd-sdwan-client{bin_ext}"
+
+            try:
+                if os.name == "nt":
+                    subprocess.run(
+                        [
+                            "powershell",
+                            "-NoProfile",
+                            "-ExecutionPolicy",
+                            "Bypass",
+                            "-File",
+                            str(dist_dir / "install-controller-windows.ps1"),
+                            "-NonInteractive",
+                            "-NoStart",
+                            "-Prefix",
+                            str(ctrl_prefix),
+                            "-BindHost",
+                            "127.0.0.1",
+                            "-Port",
+                            str(ctrl_port),
+                            "-BootstrapToken",
+                            "qkd-join-e2e-daemon",
+                        ],
+                        capture_output=True,
+                        text=True,
+                        check=True,
+                    )
+                else:
+                    subprocess.run(
+                        [
+                            "bash",
+                            str(dist_dir / "install-controller-linux.sh"),
+                            "--non-interactive",
+                            "--no-start",
+                            "--prefix",
+                            str(ctrl_prefix),
+                            "--host",
+                            "127.0.0.1",
+                            "--port",
+                            str(ctrl_port),
+                            "--bootstrap-token",
+                            "qkd-join-e2e-daemon",
+                        ],
+                        capture_output=True,
+                        text=True,
+                        check=True,
+                    )
+                subprocess.run([str(ctrl_bin), "serve", "--daemon"], capture_output=True, text=True, check=True)
+
+                for prefix, nid, wport, qport in [
+                    (jkt_prefix, "edge-jkt-01", jkt_wg, jkt_qkd),
+                    (sby_prefix, "edge-sby-02", sby_wg, sby_qkd),
+                ]:
+                    if os.name == "nt":
+                        subprocess.run(
+                            [
+                                "powershell",
+                                "-NoProfile",
+                                "-ExecutionPolicy",
+                                "Bypass",
+                                "-File",
+                                str(dist_dir / "install-client-windows.ps1"),
+                                "-NonInteractive",
+                                "-NoStart",
+                                "-Prefix",
+                                str(prefix),
+                                "-NodeId",
+                                nid,
+                                "-ControllerUrl",
+                                ctrl_url,
+                                "-JoinToken",
+                                "qkd-join-e2e-daemon",
+                                "-WgPort",
+                                str(wport),
+                                "-QkdPort",
+                                str(qport),
+                            ],
+                            capture_output=True,
+                            text=True,
+                            check=True,
+                        )
+                    else:
+                        subprocess.run(
+                            [
+                                "bash",
+                                str(dist_dir / "install-client-linux.sh"),
+                                "--non-interactive",
+                                "--no-start",
+                                "--prefix",
+                                str(prefix),
+                                "--node-id",
+                                nid,
+                                "--controller-url",
+                                ctrl_url,
+                                "--join-token",
+                                "qkd-join-e2e-daemon",
+                                "--wg-port",
+                                str(wport),
+                                "--qkd-port",
+                                str(qport),
+                            ],
+                            capture_output=True,
+                            text=True,
+                            check=True,
+                        )
+                subprocess.run(
+                    [str(jkt_bin), "serve", "--daemon", "--heartbeat-interval", "0.5"],
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                )
+                subprocess.run(
+                    [str(sby_bin), "serve", "--daemon", "--heartbeat-interval", "0.5"],
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                )
+
+                # Verify dynamic `config --controller-url` subcommand on running daemon
+                cfg_res = subprocess.run(
+                    [str(jkt_bin), "config", "--controller-url", ctrl_url],
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                )
+                cfg_json = json.loads(cfg_res.stdout)
+                self.assertEqual(cfg_json["status"], "updated")
+                self.assertTrue(cfg_json["registered_with_controller"])
+
+                # Negotiate BB84 key rotation between the 2 running Client Daemons
+                rekey_res = subprocess.run(
+                    [str(jkt_bin), "rekey", "--to", "edge-sby-02"],
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                )
+                rekey_json = json.loads(rekey_res.stdout)
+                self.assertTrue(rekey_json["psk_injected"])
+                self.assertEqual(rekey_json["injection_info"]["psk_epoch"], 1)
+
+                # Send encrypted text and file from JKT daemon to SBY daemon
+                send_txt = subprocess.run(
+                    [str(jkt_bin), "send", "--to", "edge-sby-02", "--text", "Halo Surabaya dari Daemon JKT!"],
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                )
+                self.assertEqual(json.loads(send_txt.stdout)["delivery"]["status"], "DELIVERED")
+
+                sample_file = tmp_path / "payload-secret.txt"
+                sample_file.write_text("Dokumen Rahasia Negara QKD-SDWAN 2025\n" * 25, encoding="utf-8")
+                send_file = subprocess.run(
+                    [str(jkt_bin), "send", "--to", "edge-sby-02", "--file", str(sample_file)],
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                )
+                self.assertEqual(json.loads(send_file.stdout)["delivery"]["status"], "DELIVERED")
+
+                # Export file from SBY daemon inbox and verify 100% SHA-256 bit-for-bit equality
+                export_dir = tmp_path / "exported"
+                save_res = subprocess.run(
+                    [str(sby_bin), "inbox", "--save", "2", "--dir", str(export_dir)],
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                )
+                saved_file = Path(json.loads(save_res.stdout)["saved_path"])
+                self.assertEqual(saved_file.read_bytes(), sample_file.read_bytes())
+
+                # Verify `dashboard --once` queries the live daemon without changing ports or opening duplicate sockets
+                sby_dash = subprocess.run(
+                    [str(sby_bin), "dashboard", "--once"],
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                )
+                self.assertIn("Halo Surabaya dari Daemon JKT!", sby_dash.stdout)
+                self.assertIn("payload-secret.txt", sby_dash.stdout)
+                self.assertIn(f"127.0.0.1:{sby_wg}", sby_dash.stdout)
+
+                # Restart Controller daemon and verify state persistence + client heartbeat re-registration
+                subprocess.run([str(ctrl_bin), "stop"], capture_output=True, text=True, check=True)
+                subprocess.run([str(ctrl_bin), "serve", "--daemon"], capture_output=True, text=True, check=True)
+                ctrl_stat = subprocess.run(
+                    [str(ctrl_bin), "status", "--json"],
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                )
+                nodes_map = json.loads(ctrl_stat.stdout)["nodes"]
+                self.assertIn("edge-jkt-01", nodes_map)
+                self.assertIn("edge-sby-02", nodes_map)
+                self.assertEqual(nodes_map["edge-jkt-01"]["wg_port"], jkt_wg)
+                self.assertEqual(nodes_map["edge-sby-02"]["wg_port"], sby_wg)
+            finally:
+                for bin_path in (jkt_bin, sby_bin, ctrl_bin):
+                    if bin_path.exists():
+                        subprocess.run([str(bin_path), "stop"], capture_output=True, text=True)
+
+    def test_zero_touch_onboarding_roaming_and_global_qkd_cli(self) -> None:
+        """Verify join_token='auto' zero-touch enrollment, IP collision avoidance, roaming detection, and `qkd` CLI."""
+        from qkd_sdwan.client.agent import _detect_underlay_host, _normalize_controller_url
+
+        self.assertEqual(_normalize_controller_url("192.168.1.2"), "http://192.168.1.2:8080")
+        self.assertEqual(_normalize_controller_url("http://192.168.1.2:9000/"), "http://192.168.1.2:9000")
+        # Non-local IP on configured_host must fall back when device roams away from that network
+        roamed_ip = _detect_underlay_host("http://127.0.0.1:8080", "198.51.100.254")
+        self.assertEqual(roamed_ip, "127.0.0.1")
+
+        controller = SDWANControllerServer(host="127.0.0.1", port=0)
+        controller.start_background()
+        agents: list[SDWANEndpointAgent] = []
+        try:
+            # 1. Zero-touch enrollment with join_token="auto" and idempotent re-enrollment
+            ag_win, r_win = SDWANEndpointAgent.enroll_with_controller(
+                controller_url=controller.base_url,
+                join_token="auto",
+                node_id="edge-vanne",
+            )
+            agents.append(ag_win)
+            self.assertEqual(r_win["allocated_overlay_ip"], "10.200.0.10")
+
+            ag_lin, r_lin = SDWANEndpointAgent.enroll_with_controller(
+                controller_url=controller.base_url,
+                join_token="auto",
+                node_id="edge-hanmazaya",
+            )
+            agents.append(ag_lin)
+            self.assertEqual(r_lin["allocated_overlay_ip"], "10.200.0.11")
+
+            # 2. Direct registration with colliding overlay_ip ("10.200.0.10") auto-allocates non-colliding IP
+            ag_roam = SDWANEndpointAgent("edge-roamer", "10.200.0.10", controller.base_url)
+            agents.append(ag_roam)
+            reg_roam = ag_roam.register_with_controller()
+            self.assertEqual(reg_roam["node"]["overlay_ip"], "10.200.0.12")
+            self.assertEqual(ag_roam.overlay_ip, "10.200.0.12")
+
+            # 3. Verify `qkd` positional CLI commands (peers, rekey, send, sendfile, save)
+            with tempfile.TemporaryDirectory(prefix="qkd-cli-ergo-") as tmpdir:
+                tmp_path = Path(tmpdir)
+                cfg_a = tmp_path / "a" / "endpoint.json"
+                cfg_b = tmp_path / "b" / "endpoint.json"
+                self.assertEqual(
+                    client_cli_main(
+                        [
+                            "init-config",
+                            "--output",
+                            str(cfg_a),
+                            "--node-id",
+                            "edge-cli-a",
+                            "--controller-url",
+                            controller.base_url,
+                            "--wg-port",
+                            "0",
+                            "--qkd-port",
+                            "0",
+                        ]
+                    ),
+                    0,
+                )
+                self.assertEqual(
+                    client_cli_main(
+                        [
+                            "init-config",
+                            "--output",
+                            str(cfg_b),
+                            "--node-id",
+                            "edge-cli-b",
+                            "--controller-url",
+                            controller.base_url,
+                            "--wg-port",
+                            "0",
+                            "--qkd-port",
+                            "0",
+                        ]
+                    ),
+                    0,
+                )
+                data_a = json.loads(cfg_a.read_text(encoding="utf-8"))
+                data_b = json.loads(cfg_b.read_text(encoding="utf-8"))
+                self.assertNotEqual(data_a["overlay_ip"], data_b["overlay_ip"])
+
+                peers_buf = io.StringIO()
+                with redirect_stdout(peers_buf):
+                    self.assertEqual(
+                        client_cli_main(["--config", str(cfg_a), "peers"]),
+                        0,
+                    )
+                self.assertIn("edge-vanne", peers_buf.getvalue())
+                self.assertIn("edge-hanmazaya", peers_buf.getvalue())
+        finally:
+            for ag in agents:
+                ag.close()
+            controller.shutdown()
+
+    def test_node_liveness_offline_transition_and_real_udp_probing(self) -> None:
+        """Verify real UDP multi-probe metrics, instant offline transition on stop, TTL expiry, and dashboard N/A QBER."""
+        controller = SDWANControllerServer(host="127.0.0.1", port=0, node_offline_ttl_s=6.0)
+        controller.start_background()
+        ag_a: SDWANEndpointAgent | None = None
+        ag_b: SDWANEndpointAgent | None = None
+        ag_b_restarted: SDWANEndpointAgent | None = None
+        try:
+            ag_a, _ = SDWANEndpointAgent.enroll_with_controller(controller.base_url, "auto", "edge-live-a")
+            ag_b, _ = SDWANEndpointAgent.enroll_with_controller(controller.base_url, "auto", "edge-live-b")
+            ag_a.sync_topology()
+            ag_b.sync_topology()
+
+            # 1. Negotiate BB84 and verify real UDP multi-probe metrics (zero dummy 8.0 / 0.05 constants)
+            cycle_res = ag_a.run_key_rotation_and_telemetry_cycle("edge-live-b")
+            self.assertTrue(cycle_res["psk_injected"])
+            tel = cycle_res["telemetry"]
+            self.assertEqual(tel["packet_loss_pct"], 0.0)
+            self.assertGreater(tel["latency_ms"], 0.0)
+            self.assertGreater(tel["throughput_mbps"], 0.0)
+
+            status_online = controller.get_cluster_status()
+            self.assertEqual(status_online["nodes"]["edge-live-a"]["status"], "ONLINE")
+            self.assertEqual(status_online["nodes"]["edge-live-b"]["status"], "ONLINE")
+            self.assertEqual(status_online["online_nodes"], 2)
+            self.assertEqual(status_online["offline_nodes"], 0)
+            self.assertEqual(status_online["links"][0]["link_status"], "HEALTHY")
+
+            # 2. Stop edge-live-b and verify immediate OFFLINE transition and OFFLINE_DOWN link state
+            b_wg_port = ag_b.wg_port
+            b_qkd_port = ag_b.qkd_port
+            b_priv = ag_b.wg_daemon.private_key_b64
+            b_ip = ag_b.overlay_ip
+            ag_b.close()
+            ag_b = None
+
+            status_after_stop = controller.get_cluster_status()
+            self.assertEqual(status_after_stop["nodes"]["edge-live-b"]["status"], "OFFLINE")
+            self.assertEqual(status_after_stop["online_nodes"], 1)
+            self.assertEqual(status_after_stop["offline_nodes"], 1)
+            link_ab = status_after_stop["links"][0]
+            self.assertEqual(link_ab["link_status"], "OFFLINE_DOWN")
+            self.assertEqual(link_ab["packet_loss_pct"], 100.0)
+            self.assertEqual(link_ab["key_rate_bps"], 0.0)
+            self.assertEqual(link_ab["qber"], 0.0)
+
+            ctrl_dash = render_controller_dashboard(status_after_stop, controller_url=controller.base_url)
+            self.assertIn("OFFLINE", ctrl_dash)
+            self.assertIn("N/A (OFFLINE)", ctrl_dash)
+            self.assertIn("OFFLINE_DOWN", ctrl_dash)
+            self.assertIn("DOWN / - / 100.0%", ctrl_dash)
+
+            # 3. Verify surviving peer sync_topology() and render_client_dashboard() reflect OFFLINE + QUARANTINED
+            ag_a.sync_topology()
+            self.assertEqual(ag_a.peer_registry["edge-live-b"].status, "OFFLINE")
+            self.assertEqual(ag_a.active_directives["edge-live-b"].route_mode, RouteMode.QUARANTINED)
+            self.assertEqual(ag_a.active_directives["edge-live-b"].link_status, LinkStatus.OFFLINE_DOWN)
+            client_dash = render_client_dashboard(ag_a)
+            self.assertIn("OFFLINE", client_dash)
+            self.assertIn("(STALE-OFFLINE)", client_dash)
+            self.assertIn("QUARANTINED", client_dash)
+
+            # 4. Restart edge-live-b and verify automatic recovery to ONLINE + DIRECT_P2P + HEALTHY
+            ag_b_restarted = SDWANEndpointAgent(
+                node_id="edge-live-b",
+                overlay_ip=b_ip,
+                controller_url=controller.base_url,
+                auth_secret=ag_a.auth_secret,
+                wg_port=b_wg_port,
+                qkd_port=b_qkd_port,
+                private_key_b64=b_priv,
+            )
+            ag_b_restarted.register_with_controller()
+            ag_a.sync_topology()
+            rec_res = ag_a.run_key_rotation_and_telemetry_cycle("edge-live-b")
+            self.assertTrue(rec_res["psk_injected"])
+            self.assertEqual(rec_res["evaluation"]["link_status"], "HEALTHY")
+            self.assertEqual(rec_res["directive"]["route_mode"], "DIRECT_P2P")
+
+            # 5. Verify heartbeat TTL expiry marks node OFFLINE when last_seen exceeds node_offline_ttl_s
+            with controller._lock:
+                controller._nodes["edge-live-b"].last_seen -= 15.0
+            status_ttl = controller.get_cluster_status()
+            self.assertEqual(status_ttl["nodes"]["edge-live-b"]["status"], "OFFLINE")
+            self.assertEqual(status_ttl["links"][0]["link_status"], "OFFLINE_DOWN")
+        finally:
+            for ag in (ag_a, ag_b, ag_b_restarted):
+                if ag is not None:
+                    ag.close()
             controller.shutdown()
 
 

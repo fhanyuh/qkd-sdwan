@@ -3,9 +3,10 @@
 Proof-of-Concept (PoC) sistem **SD-WAN Terdistribusi Lintas Platform (Linux & Windows)** yang mengintegrasikan:
 - **Protokol Distribusi Kunci Kuantum (QKD) BB84 Berbasis Soket** langsung antar *endpoint* (Peer-to-Peer) dengan simulasi atenuasi serat optik, depolarisasi kanal, penyadapan *intercept-resend* (Eve), koreksi kesalahan paritas blok **Cascade 2-Pass**, dan *privacy amplification* **HKDF-SHA256**.
 - **Manajemen Tunnel Overlay P2P WireGuard** yang menggabungkan pertukaran kunci X25519 dengan penyuntikan kunci simetris 256-bit hasil BB84 ke slot `PresharedKey` (PSK) secara berkala tanpa melewatkan trafik data maupun kunci rahasia ke Central Controller.
-- **Pendaftaran Otomatis Berbasis Join Token (*Token-based Auto-Enrollment*)**: Pendaftaran node endpoint zero-touch yang mengalokasikan IP overlay unik dan mendistribusikan kredensial klaster secara otomatis.
+- **Pendaftaran Otomatis Zero-Touch (`join_token="auto"`) & Multi-Network WAN/NAT Traversal**: Alokasi IP overlay anti-kolisi otomatis, deteksi *same-NAT LAN hairpinning* vs *cross-NAT WAN*, dan *failover* otomatis via Cloud Relay (`RELAY_P2P`).
+- **Real-Time Node Liveness (`ONLINE`/`OFFLINE`) & Zero-Dummy Multi-Probe Telemetry**: Pelacakan keaktifan node secara *real-time* (TTL *heartbeat* 6 detik + notifikasi *graceful disconnect* instan `/api/v1/nodes/disconnect` saat `qkd stop`), pengukuran **RTT, Jitter, Packet Loss, dan Throughput** murni dari multi-probe paket UDP terenkripsi setiap 2 detik + rotasi BB84 otomatis setiap 10 detik tanpa konstanta *dummy*, serta transisi otomatis ke `OFFLINE_DOWN` (`QBER: N/A (OFFLINE)`, `Key Rate: 0 bps`, `Loss: 100.0%`, `RouteMode: QUARANTINED`) saat service peer berhenti.
 - **Transfer Data & File P2P Terenkripsi dengan Verifikasi Integritas SHA-256**: Pengiriman dan penerimaan pesan teks maupun payload file terenkripsi AEAD (`ChaCha20Poly1305` dengan PSK BB84 256-bit) antar Client via jalur `DIRECT_P2P` atau `RELAY_P2P` dengan auto-retry UDP, deduplikasi paket, dan verifikasi SHA-256 end-to-end.
-- **Dual Interactive CLI Dashboards (Controller & Client)**: Tampilan dashboard terminal ASCII 4-panel interaktif baik pada **Central Controller** (`qkd-sdwan-controller dashboard`) maupun pada **Endpoint Client** (`qkd-sdwan-client dashboard`).
+- **Global Ergonomic CLI (`qkd` & `qkd-ctl`) dan Dual Interactive 4-Panel CLI Dashboards**: Perintah ringkas global (`qkd up`, `qkd dashboard`, `qkd peers`, `qkd rekey`, `qkd send`, `qkd sendfile`, `qkd inbox`, `qkd stop`) dan dashboard terminal ASCII 4-panel detail pada **Central Controller** maupun **Endpoint Client**.
 - **Installer Portabel Lintas Platform**: Paket aplikasi portabel `.pyz` dan installer interaktif/non-interaktif untuk **Linux** (`.sh`) dan **Windows** (`.ps1` & `.bat`).
 
 Dokumen arsitektur teknis lengkap tersedia pada [`docs/ARCHITECTURE_BLUEPRINT.md`](docs/ARCHITECTURE_BLUEPRINT.md).
@@ -138,7 +139,7 @@ python3 scripts/run_poc_demo.py
 
 ### 3. Menjalankan Suite Pengujian Otomatis (`unittest`)
 
-Seluruh 11 modul pengujian unit, integrasi, & reliabilitas dapat dijalankan dengan:
+Seluruh 15 modul pengujian unit, integrasi, liveness real-time, daemon produksi, & reliabilitas dapat dijalankan dengan:
 
 ```bash
 python3 -m unittest discover -s tests -p "test_*.py" -v
@@ -156,7 +157,10 @@ Cakupan pengujian mencakup:
 - `test_controller_cli_dashboard_and_cross_platform_installers`: Output ASCII Dashboard Controller dan builder paket installer lintas platform.
 - `test_client_cli_dashboard_and_file_integrity`: Output 4-panel ASCII Dashboard Client, ekspor file inbox ke disk, dan deteksi integritas SHA-256.
 - `test_concurrent_bb84_and_out_of_order_enrollment_reliability`: Reliabilitas negosiasi BB84 paralel multi-thread dan auto-sync topologi pada pendaftaran *out-of-order*.
-
+- `test_init_config_subcommand_config_precedence_and_windows_hardening`: Verifikasi subcommand `init-config`, preservasi `--config`, normalisasi alamat Windows, dan installer 7-bit ASCII.
+- `test_production_daemon_ipc_wan_roaming_and_2node_e2e`: Verifikasi Public/WAN IP discovery, WireGuard dynamic NAT endpoint roaming, serta pengujian E2E 3 proses daemon OS terpisah (`1 Controller Daemon` + `2 Client Daemon`).
+- `test_zero_touch_onboarding_roaming_and_global_qkd_cli`: Verifikasi pendaftaran *zero-touch* (`join_token="auto"`), penghindaran tabrakan IP overlay, deteksi *roaming*, dan perintah CLI global `qkd`.
+- `test_node_liveness_offline_transition_and_real_udp_probing`: Verifikasi metrik multi-probe UDP real (tanpa konstanta *dummy*), transisi instan ke `OFFLINE` & `OFFLINE_DOWN` saat `qkd stop` atau TTL *heartbeat* terlampaui, tampilan `N/A (OFFLINE)` pada QBER, serta pemulihan otomatis ke `ONLINE` & `DIRECT_P2P` saat peer kembali aktif.
 ## Pemasangan & Penggunaan Lintas Platform
 
 ### A. Central Controller
@@ -188,8 +192,14 @@ dist\install-controller-windows.bat -NonInteractive -BindHost "0.0.0.0" -Port 80
 
 #### Menjalankan Central Controller & CLI Dashboard
 ```bash
-# Menjalankan server Controller dengan konsol dashboard interaktif
+# Menjalankan server Controller di latar belakang (Background Daemon)
+qkd-sdwan-controller serve --daemon
+
+# Atau menjalankan di foreground dengan konsol dashboard interaktif
 qkd-sdwan-controller serve --dashboard
+
+# Menghentikan background daemon Controller
+qkd-sdwan-controller stop
 
 # Menampilkan snapshot dashboard satu kali
 qkd-sdwan-controller dashboard --once
@@ -228,87 +238,103 @@ bash dist/install-client-linux.sh --non-interactive \
   -NodeId "edge-jkt-01"
 ```
 
-#### Menggunakan Client CLI
+#### Menggunakan Global Client CLI (`qkd` / `qkd-sdwan-client`)
+Setelah instalasi, perintah singkat **`qkd`** tersedia secara global di terminal (Linux maupun Windows PowerShell/CMD):
+
 ```bash
-# 1. Pendaftaran mandiri dengan Join Token
-qkd-sdwan-client enroll \
-  --controller-url http://127.0.0.1:8080 \
-  --join-token <TOKEN_SECRET> \
-  --node-id edge-bdg-02 \
-  --output-config /etc/qkd-sdwan/endpoint.json
+# 1. Menyalakan / menghubungkan daemon Client ke Controller (Zero-Touch Auto-Enrollment)
+qkd up http://201.18.208.72:8080
 
-# 2. Mengirim pesan teks terenkripsi P2P ke node lain
-qkd-sdwan-client send --to edge-bdg-02 --text "Pesan rahasia ber-PSK BB84 256-bit"
+# 2. Membuka 4-Panel Interactive CLI Dashboard Client (Interaktif / Snapshot / Live Auto-Refresh)
+qkd dashboard
+qkd dashboard --once
+qkd dashboard --interval 2.0
 
-# 3. Mengirim file dokumen/biner terenkripsi P2P ke node lain
-qkd-sdwan-client send --to edge-bdg-02 --file /path/to/dokumen.pdf
+# 3. Melihat daftar peer SD-WAN & status tunnel WireGuard
+qkd peers
 
-# 4. Membuka 4-Panel Interactive CLI Dashboard Client (Mode Interaktif / Snapshot / Auto-Refresh)
-qkd-sdwan-client dashboard
-qkd-sdwan-client dashboard --once
-qkd-sdwan-client dashboard --interval 2.0
+# 4. Negosiasi kunci kuantum BB84 & injeksi PSK 256-bit (ke satu peer atau seluruh peer)
+qkd rekey edge-vespoch
+qkd rekey --all
 
-# 5. Membuka Konsol Interaktif Client (Live Inbox & BB84 Rekeying)
-qkd-sdwan-client console
-# Perintah di dalam console:
-# edge-jkt-01> dashboard                (Tampilkan 4-panel Client CLI Dashboard penuh)
-# edge-jkt-01> peers                    (Lihat daftar peer P2P & mode rute)
-# edge-jkt-01> rekey edge-bdg-02        (Jalankan negosiasi kunci kuantum BB84 baru)
-# edge-jkt-01> send edge-bdg-02 <msg>   (Kirim pesan teks terenkripsi P2P)
-# edge-jkt-01> sendfile edge-bdg-02 <f> (Kirim file biner terenkripsi P2P)
-# edge-jkt-01> inbox                    (Lihat daftar pesan & file yang diterima)
-# edge-jkt-01> savefile 1 ./downloads   (Simpan file dari inbox ke direktori lokal)
-# edge-jkt-01> quit
+# 5. Mengirim pesan teks & file biner terenkripsi ChaCha20Poly1305 P2P ke peer
+qkd send edge-vespoch "Pesan rahasia ber-PSK BB84 256-bit"
+qkd sendfile edge-vespoch /path/to/dokumen.pdf
 
-# 6. Memeriksa status identitas endpoint lokal
-qkd-sdwan-client status --json
+# 6. Melihat daftar pesan/file masuk (Inbox) & menyimpan file terverifikasi SHA-256 ke disk
+qkd inbox
+qkd save 1 ./downloads
+
+# 7. Menghentikan daemon Client (otomatis mengirim sinyal disconnect OFFLINE ke Controller)
+qkd stop
+
+# 8. Memeriksa status identitas & daemon endpoint lokal dalam format JSON
+qkd status
 ```
+
 ---
 
-## Tampilan CLI Dashboard Central Controller
+## Tampilan CLI Dashboard Central Controller & Endpoint Client
 
-Contoh tampilan **4-Panel Interactive ASCII Dashboard**:
+### 1. Central Controller Dashboard (`qkd-ctl dashboard --once`)
+Menampilkan status *liveness* setiap endpoint (`ONLINE`/`OFFLINE`), `Last Seen`, IP WAN & LAN, serta metrik kanal kuantum BB84 dan underlay (`RTT / Jitter / Loss`, `Throughput`, `Epoch/Aborts`, `ML Score`, `Updated`, dan `LinkStatus`):
 
 ```text
-====================================================================================================================
+====================================================================================================================================
  QKD-SDWAN CENTRAL CONTROLLER — INTERACTIVE CLI DASHBOARD (BB84 QKD + ISOLATION FOREST ML) 
-====================================================================================================================
- Controller URL : http://127.0.0.1:8080              | Timestamp          : 2026-11-06 21:11:05 UTC
- Overlay Subnet : 10.200.0.0/24                      | Registered Nodes   : 3
- Active Links   : 3                                  | Routing Directives : 6
---------------------------------------------------------------------------------------------------------------------
+====================================================================================================================================
+ Controller URL : http://127.0.0.1:8080                  | Timestamp          : 2026-11-07 08:28:18 UTC
+ Overlay Subnet : 10.200.0.0/24                          | Nodes (On/Off/Tot) : 3 ONLINE / 0 OFFLINE / 3 TOTAL
+ Active Links   : 6 HEALTHY / 6 TOTAL                    | Routing Directives : 6
+------------------------------------------------------------------------------------------------------------------------------------
 [1] CLUSTER ENROLLMENT JOIN TOKENS (Token-Based Zero-Touch Client Onboarding)
-+--------------+-------------------+-------+---------+--------+------------------------------------+
-| Token ID     | Label             | Uses  | TTL Rem | Status | Join Token (for Client Enrollment) |
-+--------------+-------------------+-------+---------+--------+------------------------------------+
-| tok-1ea5e17b | bootstrap-default | 3/100 | 86399s  | ACTIVE | qkd-join-5790e279fc901544249a851a  |
-+--------------+-------------------+-------+---------+--------+------------------------------------+
++--------------+-------------------+---------+-----------+--------+------------------------------------+
+| Token ID     | Label             | Uses    | TTL Rem   | Status | Join Token (for Client Enrollment) |
++--------------+-------------------+---------+-----------+--------+------------------------------------+
+| tok-88ce5288 | bootstrap-default | 3/10000 | 31530597s | ACTIVE | qkd-join-450fa730dbedf93c2947a017  |
++--------------+-------------------+---------+-----------+--------+------------------------------------+
 
 [2] REGISTERED P2P SD-WAN ENDPOINT CLIENTS
-+-------------+-------------+----------------------+----------+-----------------------+-------------------------+
-| Node ID     | Overlay IP  | Underlay WG Endpoint | QKD Port | Auth Token ID         | WG X25519 Public Key    |
-+-------------+-------------+----------------------+----------+-----------------------+-------------------------+
-| edge-bdg-02 | 10.200.0.11 | 127.0.0.1:42381      | 43363    | enrolled-tok-1ea5e17b | fOPD5JhphXfMvXuisK/v... |
-| edge-jkt-01 | 10.200.0.10 | 127.0.0.1:37272      | 39391    | enrolled-tok-1ea5e17b | 0Wl+HNO1WS+TuvE6d/ho... |
-| edge-sby-03 | 10.200.0.12 | 127.0.0.1:51963      | 41369    | enrolled-tok-1ea5e17b | fRe9agwFfZSVvfYXYL71... |
-+-------------+-------------+----------------------+----------+-----------------------+-------------------------+
++------------------+--------+-----------+-------------+----------------------+---------------+----------+-----------------------+-----------------------+
+| Node ID          | Status | Last Seen | Overlay IP  | Underlay WG Endpoint | LAN IP        | QKD Port | Auth Token ID         | WG X25519 Public Key  |
++------------------+--------+-----------+-------------+----------------------+---------------+----------+-----------------------+-----------------------+
+| edge-cloud-relay | ONLINE | 0.0s ago  | 10.200.0.10 | 201.18.208.72:51820  | 201.18.208.72 | 52820    | enrolled-tok-88ce5288 | IYRnZPkaUquDG8yw5W... |
+| edge-hanmazaya   | ONLINE | 0.1s ago  | 10.200.0.11 | 114.10.149.143:51820 | 192.168.1.30  | 52820    | enrolled-tok-88ce5288 | jgNSp2JGH1bPIKVzAr... |
+| edge-vespoch     | ONLINE | 1.0s ago  | 10.200.0.12 | 182.10.97.58:51820   | 192.168.1.2   | 52820    | enrolled-tok-88ce5288 | vzCu1oLp12Pny2Hp42... |
++------------------+--------+-----------+-------------+----------------------+---------------+----------+-----------------------+-----------------------+
 
 [3] QUANTUM BB84 CHANNEL TELEMETRY & ISOLATION FOREST ANOMALY MONITOR
-+----------------------------+--------+------------+----------------+---------------+-----------+--------+----------+---------------------+
-| Directed Link              | QBER   | Delta QBER | Key Rate (bps) | RTT / Loss    | PSK Epoch | Aborts | ML Score | LinkStatus          |
-+----------------------------+--------+------------+----------------+---------------+-----------+--------+----------+---------------------+
-| edge-bdg-02 -> edge-sby-03 | 1.34%  | +0.00%     | 7068           | 11.2ms / 0.1% | 1         | 0      | 0.411    | HEALTHY             |
-| edge-jkt-01 -> edge-bdg-02 | 2.01%  | +0.00%     | 6774           | 9.5ms / 0.1%  | 1         | 0      | 0.400    | HEALTHY             |
-| edge-jkt-01 -> edge-sby-03 | 18.00% | +10.05%    | 0              | 16.0ms / 0.2% | 3         | 1      | 0.882    | COMPROMISED_BLOCKED |
-+----------------------------+--------+------------+----------------+---------------+-----------+--------+----------+---------------------+
++------------------------------------+-------+-------+------------+----------------+------------------------+------------+--------------+----------+----------+------------+
+| Directed Link                      | State | QBER  | Delta QBER | Key Rate (bps) | RTT / Jitter / Loss    | Throughput | Epoch/Aborts | ML Score | Updated  | LinkStatus |
++------------------------------------+-------+-------+------------+----------------+------------------------+------------+--------------+----------+----------+------------+
+| edge-cloud-relay -> edge-hanmazaya | UP    | 1.26% | +0.00%     | 2689 bps       | 33.7ms / 15.9ms / 0.0% | 0.1 Mbps   | 154 / 0      | 0.444    | 0.1s ago | HEALTHY    |
+| edge-cloud-relay -> edge-vespoch   | UP    | 2.03% | +0.00%     | 3025 bps       | 21.9ms / 0.3ms / 0.0%  | 0.2 Mbps   | 4 / 0        | 0.425    | 0.0s ago | HEALTHY    |
+| edge-hanmazaya -> edge-cloud-relay | UP    | 1.26% | -0.07%     | 1708 bps       | 24.5ms / 1.1ms / 0.0%  | 0.2 Mbps   | 154 / 0      | 0.428    | 0.1s ago | HEALTHY    |
+| edge-hanmazaya -> edge-vespoch     | UP    | 0.78% | +0.00%     | 2518 bps       | 50.1ms / 1.1ms / 0.0%  | 0.1 Mbps   | 69 / 0       | 0.401    | 0.1s ago | HEALTHY    |
+| edge-vespoch -> edge-cloud-relay   | UP    | 2.03% | -0.64%     | 1887 bps       | 24.8ms / 3.8ms / 0.0%  | 0.2 Mbps   | 4 / 0        | 0.431    | 1.0s ago | HEALTHY    |
+| edge-vespoch -> edge-hanmazaya     | UP    | 2.34% | +0.00%     | 1094 bps       | 52.5ms / 4.4ms / 0.0%  | 0.1 Mbps   | 4 / 0        | 0.461    | 1.0s ago | HEALTHY    |
++------------------------------------+-------+-------+------------+----------------+------------------------+------------+--------------+----------+----------+------------+
 
 [4] ACTIVE P2P OVERLAY ROUTING DIRECTIVES (DIRECT_P2P vs RELAY_P2P)
-+----------------------------+------------+-------------+-------------------+-------------+--------------------------------------------------+
-| Source -> Target           | RouteMode  | Next Hop    | Next Hop Endpoint | Force Rekey | Reason                                           |
-+----------------------------+------------+-------------+-------------------+-------------+--------------------------------------------------+
-| edge-bdg-02 -> edge-sby-03 | DIRECT_P2P | edge-sby-03 | 127.0.0.1:51963   | NO          | Direct P2P link healthy (cost=14.3)              |
-| edge-jkt-01 -> edge-bdg-02 | DIRECT_P2P | edge-bdg-02 | 127.0.0.1:42381   | NO          | Direct P2P link healthy (cost=12.4)              |
-| edge-jkt-01 -> edge-sby-03 | RELAY_P2P  | edge-bdg-02 | 127.0.0.1:42381   | YES         | Rerouted via P2P relay edge-bdg-02 due to COM... |
-+----------------------------+------------+-------------+-------------------+-------------+--------------------------------------------------+
-====================================================================================================================
++------------------------------------+------------+------------------+----------------------+------------+-------------+-------------------------------------+
+| Source -> Target                   | RouteMode  | Next Hop         | Next Hop Endpoint    | LinkStatus | Force Rekey | Reason                              |
++------------------------------------+------------+------------------+----------------------+------------+-------------+-------------------------------------+
+| edge-cloud-relay -> edge-hanmazaya | DIRECT_P2P | edge-hanmazaya   | 114.10.149.143:51820 | HEALTHY    | NO          | Direct P2P link healthy (cost=73.4) |
+| edge-cloud-relay -> edge-vespoch   | DIRECT_P2P | edge-vespoch     | 182.10.97.58:51820   | HEALTHY    | NO          | Direct P2P link healthy (cost=22.6) |
+| edge-hanmazaya -> edge-cloud-relay | DIRECT_P2P | edge-cloud-relay | 201.18.208.72:51820  | HEALTHY    | NO          | Direct P2P link healthy (cost=27.2) |
+| edge-hanmazaya -> edge-vespoch     | DIRECT_P2P | edge-vespoch     | 182.10.97.58:51820   | HEALTHY    | NO          | Direct P2P link healthy (cost=52.8) |
+| edge-vespoch -> edge-cloud-relay   | DIRECT_P2P | edge-cloud-relay | 201.18.208.72:51820  | HEALTHY    | NO          | Direct P2P link healthy (cost=34.3) |
+| edge-vespoch -> edge-hanmazaya     | DIRECT_P2P | edge-hanmazaya   | 114.10.149.143:51820 | HEALTHY    | NO          | Direct P2P link healthy (cost=63.5) |
++------------------------------------+------------+------------------+----------------------+------------+-------------+-------------------------------------+
+====================================================================================================================================
+```
+
+### 2. Ketika Salah Satu Endpoint Dimatikan (`qkd stop` / Offline)
+Saat service pada salah satu endpoint berhenti (atau tidak mengirim *heartbeat* > 6 detik), status node langsung berubah menjadi `OFFLINE`, nilai QBER berubah menjadi `N/A (OFFLINE)`, `Key Rate` menjadi `0 bps`, `Loss` menjadi `100.0%`, `LinkStatus` menjadi `OFFLINE_DOWN`, dan rute menuju node tersebut diubah ke `QUARANTINED`:
+
+```text
+| edge-vespoch     | OFFLINE | 2.2s ago  | 10.200.0.12 | 182.10.97.58:51820   | 192.168.1.2   | 52820    |
+...
+| edge-cloud-relay -> edge-vespoch   | DOWN  | N/A (OFFLINE) | -      | 0 bps   | DOWN / - / 100.0%     | 0.0 Mbps | OFFLINE_DOWN |
+| edge-hanmazaya -> edge-vespoch     | DOWN  | N/A (OFFLINE) | -      | 0 bps   | DOWN / - / 100.0%     | 0.0 Mbps | OFFLINE_DOWN |
 ```

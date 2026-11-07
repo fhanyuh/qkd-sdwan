@@ -8,7 +8,11 @@ import json
 import os
 from pathlib import Path
 import secrets
+import signal
 import socket
+import subprocess
+import sys
+import tempfile
 import time
 from typing import Any
 import urllib.error
@@ -69,31 +73,36 @@ def render_controller_dashboard(
 ) -> str:
     """Render a 4-panel ASCII CLI Dashboard for the Central Controller."""
     now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    now_ts = time.time()
     nodes_dict: dict[str, dict[str, Any]] = cluster_status.get("nodes", {}) or {}
     links_list: list[dict[str, Any]] = cluster_status.get("links", []) or []
     directives_list: list[dict[str, Any]] = cluster_status.get("directives", []) or []
     tokens_list: list[dict[str, Any]] = cluster_status.get("tokens", []) or []
     subnet_prefix = cluster_status.get("overlay_subnet_prefix", "10.200.0.")
 
+    total_nodes = len(nodes_dict)
+    online_nodes = sum(1 for n in nodes_dict.values() if str(n.get("status", "ONLINE")).upper() != "OFFLINE")
+    offline_nodes = total_nodes - online_nodes
+    healthy_links = sum(1 for lk in links_list if str(lk.get("link_status", "")) == "HEALTHY")
+
     lines: list[str] = []
-    banner = "=" * 116
+    banner = "=" * 132
     lines.append(banner)
     lines.append(" QKD-SDWAN CENTRAL CONTROLLER — INTERACTIVE CLI DASHBOARD (BB84 QKD + ISOLATION FOREST ML) ")
     lines.append(banner)
     lines.append(
-        f" Controller URL : {controller_url:<34} | Timestamp          : {now_str}"
+        f" Controller URL : {controller_url:<38} | Timestamp          : {now_str}"
     )
     lines.append(
-        f" Overlay Subnet : {subnet_prefix + '0/24':<34} | Registered Nodes   : {len(nodes_dict)}"
+        f" Overlay Subnet : {subnet_prefix + '0/24':<38} | Nodes (On/Off/Tot) : {online_nodes} ONLINE / {offline_nodes} OFFLINE / {total_nodes} TOTAL"
     )
     lines.append(
-        f" Active Links   : {len(links_list):<34} | Routing Directives : {len(directives_list)}"
+        f" Active Links   : {f'{healthy_links} HEALTHY / {len(links_list)} TOTAL':<38} | Routing Directives : {len(directives_list)}"
     )
-    lines.append("-" * 116)
+    lines.append("-" * 132)
 
     # Panel 1: Join Tokens
     lines.append("[1] CLUSTER ENROLLMENT JOIN TOKENS (Token-Based Zero-Touch Client Onboarding)")
-    now_ts = time.time()
     token_rows: list[list[str]] = []
     for tok in tokens_list:
         revoked = bool(tok.get("revoked", False))
@@ -132,12 +141,19 @@ def render_controller_dashboard(
     node_rows: list[list[str]] = []
     for nid, ninfo in sorted(nodes_dict.items()):
         pub_key = str(ninfo.get("wg_public_key", ""))
-        short_pub = f"{pub_key[:20]}..." if len(pub_key) > 23 else pub_key
+        short_pub = f"{pub_key[:18]}..." if len(pub_key) > 21 else pub_key
+        n_status = str(ninfo.get("status", "ONLINE") or "ONLINE").upper()
+        last_seen_val = float(ninfo.get("last_seen", ninfo.get("registered_at", 0.0)) or 0.0)
+        seen_str = f"{max(0.0, now_ts - last_seen_val):.1f}s ago" if last_seen_val > 10.0 else "0.0s ago"
+        lan_ip = str(ninfo.get("lan_host") or "-")
         node_rows.append(
             [
                 nid,
+                n_status,
+                seen_str,
                 str(ninfo.get("overlay_ip", "")),
                 f"{ninfo.get('underlay_host', '127.0.0.1')}:{ninfo.get('wg_port', 0)}",
+                lan_ip,
                 str(ninfo.get("qkd_port", 0)),
                 str(ninfo.get("auth_token_id", "")),
                 short_pub,
@@ -147,8 +163,11 @@ def render_controller_dashboard(
         _format_ascii_table(
             [
                 "Node ID",
+                "Status",
+                "Last Seen",
                 "Overlay IP",
                 "Underlay WG Endpoint",
+                "LAN IP",
                 "QKD Port",
                 "Auth Token ID",
                 "WG X25519 Public Key",
@@ -162,27 +181,70 @@ def render_controller_dashboard(
     lines.append("[3] QUANTUM BB84 CHANNEL TELEMETRY & ISOLATION FOREST ANOMALY MONITOR")
     link_rows: list[list[str]] = []
     for lk in links_list:
-        pair_str = f"{lk.get('source_node', '')} -> {lk.get('target_node', '')}"
-        qber_pct = f"{float(lk.get('qber', 0.0)) * 100:.2f}%"
-        dqber_pct = f"{float(lk.get('qber_delta', 0.0)) * 100:+.2f}%"
-        krate = f"{float(lk.get('key_rate_bps', 0.0)):.0f}"
-        rtts = f"{float(lk.get('latency_ms', 0.0)):.1f}ms / {float(lk.get('packet_loss_pct', 0.0)):.1f}%"
+        src_n = str(lk.get("source_node", ""))
+        dst_n = str(lk.get("target_node", ""))
+        pair_str = f"{src_n} -> {dst_n}"
+        lstatus = str(lk.get("link_status", "UNKNOWN"))
+        src_status = str((nodes_dict.get(src_n) or {}).get("status", "ONLINE")).upper()
+        dst_status = str((nodes_dict.get(dst_n) or {}).get("status", "ONLINE")).upper()
+        is_offline_link = (
+            lstatus == "OFFLINE_DOWN"
+            or src_status == "OFFLINE"
+            or dst_status == "OFFLINE"
+        )
+        tel_ts = float(lk.get("timestamp", 0.0) or 0.0)
+        upd_str = f"{max(0.0, now_ts - tel_ts):.1f}s ago" if tel_ts > 10.0 else "live"
         epoch = str(lk.get("psk_epoch", 0))
         aborts = str(lk.get("qkd_abort_count", 0))
         score = f"{float(lk.get('anomaly_score', 0.0)):.3f}"
-        lstatus = str(lk.get("link_status", "UNKNOWN"))
-        link_rows.append([pair_str, qber_pct, dqber_pct, krate, rtts, epoch, aborts, score, lstatus])
+
+        if is_offline_link:
+            state_str = "DOWN"
+            qber_pct = "N/A (OFFLINE)"
+            dqber_pct = "-"
+            krate = "0 bps"
+            rtts = "DOWN / - / 100.0%"
+            tput_str = "0.0 Mbps"
+            lstatus = "OFFLINE_DOWN"
+        else:
+            state_str = "UP"
+            qber_pct = f"{float(lk.get('qber', 0.0)) * 100:.2f}%"
+            dqber_pct = f"{float(lk.get('qber_delta', 0.0)) * 100:+.2f}%"
+            krate = f"{float(lk.get('key_rate_bps', 0.0)):.0f} bps"
+            rtt_v = float(lk.get("latency_ms", 0.0))
+            jit_v = float(lk.get("jitter_ms", 0.0))
+            loss_v = float(lk.get("packet_loss_pct", 0.0))
+            rtts = f"{rtt_v:.1f}ms / {jit_v:.1f}ms / {loss_v:.1f}%"
+            tput_str = f"{float(lk.get('throughput_mbps', 0.0)):.1f} Mbps"
+
+        link_rows.append(
+            [
+                pair_str,
+                state_str,
+                qber_pct,
+                dqber_pct,
+                krate,
+                rtts,
+                tput_str,
+                f"{epoch} / {aborts}",
+                score,
+                upd_str,
+                lstatus,
+            ]
+        )
     lines.extend(
         _format_ascii_table(
             [
                 "Directed Link",
+                "State",
                 "QBER",
                 "Delta QBER",
                 "Key Rate (bps)",
-                "RTT / Loss",
-                "PSK Epoch",
-                "Aborts",
+                "RTT / Jitter / Loss",
+                "Throughput",
+                "Epoch/Aborts",
                 "ML Score",
+                "Updated",
                 "LinkStatus",
             ],
             link_rows,
@@ -198,14 +260,15 @@ def render_controller_dashboard(
         rmode = str(d.get("route_mode", ""))
         nhop = str(d.get("next_hop_node", "")) or "-"
         nep = str(d.get("next_hop_endpoint", "")) or "-"
+        d_status = str(d.get("link_status", "HEALTHY"))
         rekey = "YES" if d.get("force_rekey") else "NO"
         reason = str(d.get("reason", ""))
         if len(reason) > 48:
             reason = reason[:45] + "..."
-        dir_rows.append([pair_str, rmode, nhop, nep, rekey, reason])
+        dir_rows.append([pair_str, rmode, nhop, nep, d_status, rekey, reason])
     lines.extend(
         _format_ascii_table(
-            ["Source -> Target", "RouteMode", "Next Hop", "Next Hop Endpoint", "Force Rekey", "Reason"],
+            ["Source -> Target", "RouteMode", "Next Hop", "Next Hop Endpoint", "LinkStatus", "Force Rekey", "Reason"],
             dir_rows,
         )
     )
@@ -224,6 +287,7 @@ def build_controller_parser() -> argparse.ArgumentParser:
     parser.add_argument("--subnet-prefix", default=None, help="Overlay IPv4 /24 prefix (default: 10.200.0.)")
     parser.add_argument("--bootstrap-token", default=None, help="Custom initial Join Token string")
     parser.add_argument("--dashboard", action="store_true", help="Launch interactive CLI dashboard while serving")
+    parser.add_argument("-d", "--daemon", action="store_true", help="Run Controller server as a background daemon process")
     parser.add_argument("--check-config", action="store_true", help="Validate configuration and exit")
 
     subparsers = parser.add_subparsers(dest="subcommand")
@@ -236,8 +300,28 @@ def build_controller_parser() -> argparse.ArgumentParser:
     serve_p.add_argument("--subnet-prefix", default=argparse.SUPPRESS, help="Overlay IPv4 /24 prefix (default: 10.200.0.)")
     serve_p.add_argument("--bootstrap-token", default=argparse.SUPPRESS, help="Custom initial Join Token string")
     serve_p.add_argument("--dashboard", action="store_true", default=argparse.SUPPRESS, help="Run interactive CLI dashboard console")
+    serve_p.add_argument("-d", "--daemon", action="store_true", default=argparse.SUPPRESS, help="Run Controller server as a background daemon process")
     serve_p.add_argument("--check-config", action="store_true", default=argparse.SUPPRESS, help="Validate configuration and exit")
 
+    # subcommand: up (alias for serve --daemon)
+    up_p = subparsers.add_parser("up", help="Start the Central Controller daemon in the background")
+    up_p.add_argument("--config", type=Path, default=argparse.SUPPRESS, help="Path to JSON controller configuration file")
+    up_p.add_argument("--host", default=argparse.SUPPRESS, help="Bind IP address (default: 0.0.0.0)")
+    up_p.add_argument("--port", type=int, default=argparse.SUPPRESS, help="Bind HTTP port (default: 8080)")
+    up_p.add_argument("--subnet-prefix", default=argparse.SUPPRESS, help="Overlay IPv4 /24 prefix (default: 10.200.0.)")
+    up_p.add_argument("--bootstrap-token", default=argparse.SUPPRESS, help="Custom initial Join Token string")
+
+    # subcommand: stop
+    stop_p = subparsers.add_parser("stop", help="Stop a running background Controller daemon")
+    stop_p.add_argument("--config", type=Path, default=argparse.SUPPRESS, help="Path to JSON controller configuration file")
+    stop_p.add_argument("--controller-url", default=None, help="Controller base URL")
+    stop_p.add_argument("--port", type=int, default=argparse.SUPPRESS, help="Controller HTTP port (default: 8080)")
+
+    # subcommand: down (alias for stop)
+    down_p = subparsers.add_parser("down", help="Stop a running background Controller daemon")
+    down_p.add_argument("--config", type=Path, default=argparse.SUPPRESS, help="Path to JSON controller configuration file")
+    down_p.add_argument("--controller-url", default=None, help="Controller base URL")
+    down_p.add_argument("--port", type=int, default=argparse.SUPPRESS, help="Controller HTTP port (default: 8080)")
     # subcommand: init-config
     init_p = subparsers.add_parser("init-config", help="Generate initial controller.json configuration and bootstrap Join Token")
     init_p.add_argument("--output", type=Path, required=True, help="Output path for controller.json")
@@ -285,6 +369,40 @@ def build_controller_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _resolve_controller_config_path(args: argparse.Namespace) -> Path | None:
+    config_path: Path | None = getattr(args, "config", None)
+    if config_path is None:
+        env_cfg = os.environ.get("QKD_SDWAN_CONTROLLER_CONFIG")
+        if env_cfg:
+            config_path = Path(env_cfg)
+    if config_path is not None:
+        return Path(config_path)
+    if getattr(args, "port", None) is not None:
+        return None
+    candidates: list[Path] = [
+        Path.home() / ".local" / "share" / "qkd-sdwan-controller" / "etc" / "controller.json",
+        Path("/opt/qkd-sdwan-controller/etc/controller.json"),
+    ]
+    for env_key in ("LOCALAPPDATA", "ProgramData"):
+        env_dir = os.environ.get(env_key)
+        if env_dir:
+            candidates.append(Path(env_dir) / "qkd-sdwan-controller" / "etc" / "controller.json")
+    for cand in candidates:
+        if cand.is_file():
+            return cand
+    return None
+
+def _resolve_controller_paths(args: argparse.Namespace, port: int) -> tuple[Path, Path]:
+    config_path = _resolve_controller_config_path(args)
+    if config_path is not None:
+        return config_path.with_suffix(".state.json"), config_path.with_suffix(".pid.json")
+    tmp_dir = Path(tempfile.gettempdir())
+    return (
+        tmp_dir / f"qkd-sdwan-controller-{port}.state.json",
+        tmp_dir / f"qkd-sdwan-controller-{port}.pid.json",
+    )
+
+
 def _load_controller_config(args: argparse.Namespace) -> dict[str, Any]:
     cfg: dict[str, Any] = {
         "host": "0.0.0.0",
@@ -293,16 +411,11 @@ def _load_controller_config(args: argparse.Namespace) -> dict[str, Any]:
         "cluster_hmac_secret_hex": None,
         "bootstrap_join_token": None,
     }
-    config_path: Path | None = getattr(args, "config", None)
-    if config_path is None:
-        env_cfg = os.environ.get("QKD_SDWAN_CONTROLLER_CONFIG")
-        if env_cfg:
-            config_path = Path(env_cfg)
+    config_path = _resolve_controller_config_path(args)
     if config_path and config_path.exists():
         loaded = json.loads(config_path.read_text(encoding="utf-8"))
         if isinstance(loaded, dict):
             cfg.update(loaded)
-
     if getattr(args, "host", None) is not None:
         cfg["host"] = args.host
     if getattr(args, "port", None) is not None:
@@ -359,12 +472,156 @@ def _run_serve(args: argparse.Namespace) -> int:
         )
         return 0
 
+    port_num = int(cfg["port"])
+    state_path, pid_path = _resolve_controller_paths(args, port_num)
+    bound_host_cfg = str(cfg["host"])
+    display_host_cfg = "127.0.0.1" if bound_host_cfg in ("0.0.0.0", "::", "") else bound_host_cfg
+    target_ctrl_url = f"http://{display_host_cfg}:{port_num}"
+
+    if os.environ.get("QKD_SDWAN_DAEMON_CHILD") != "1":
+        try:
+            health = _http_json(f"{target_ctrl_url}/api/v1/health", timeout=0.6)
+            if health.get("status") == "ok":
+                if getattr(args, "daemon", False):
+                    status_info = _http_json(f"{target_ctrl_url}/api/v1/cluster/status", timeout=2.0)
+                    tokens = status_info.get("tokens", [])
+                    boot_tok = tokens[0].get("secret_token", "") if tokens else (cfg.get("bootstrap_join_token") or "")
+                    print("=" * 96)
+                    print(f" QKD-SDWAN Central Controller Daemon Already Running at {target_ctrl_url}")
+                    print(f" State File           : {state_path}")
+                    print(f" Bootstrap Join Token : {boot_tok}")
+                    print("=" * 96)
+                    return 0
+                if getattr(args, "dashboard", False):
+                    setattr(args, "controller_url", target_ctrl_url)
+                    setattr(args, "once", False)
+                    setattr(args, "interval", 2.0)
+                    return _run_dashboard(args)
+        except Exception:
+            pass
+
+    if getattr(args, "daemon", False) and os.environ.get("QKD_SDWAN_DAEMON_CHILD") != "1":
+        child_env = os.environ.copy()
+        child_env["QKD_SDWAN_DAEMON_CHILD"] = "1"
+        py_paths = [p for p in sys.path if p]
+        if py_paths:
+            existing_pp = child_env.get("PYTHONPATH", "")
+            child_env["PYTHONPATH"] = os.pathsep.join(py_paths + ([existing_pp] if existing_pp else []))
+        child_cmd = [sys.executable, "-m", "qkd_sdwan.controller.cli"]
+        config_path = _resolve_controller_config_path(args)
+        if config_path is not None:
+            child_cmd.extend(["--config", str(config_path)])
+        child_cmd.extend(
+            [
+                "serve",
+                "--host",
+                str(cfg["host"]),
+                "--port",
+                str(port_num),
+                "--subnet-prefix",
+                str(cfg.get("overlay_subnet_prefix", "10.200.0.")),
+            ]
+        )
+        if cfg.get("bootstrap_join_token"):
+            child_cmd.extend(["--bootstrap-token", str(cfg["bootstrap_join_token"])])
+
+        log_path = state_path.with_suffix(".log")
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        spawned_pid: int | None = None
+        if os.name == "nt":
+            try:
+                launch_cmd_path = state_path.with_suffix(".launch.cmd")
+                cmd_str = subprocess.list2cmdline(child_cmd)
+                bat_lines = [
+                    "@echo off",
+                    "set \"QKD_SDWAN_DAEMON_CHILD=1\"",
+                    f"set \"PYTHONPATH={child_env.get('PYTHONPATH', '')}\"",
+                    f"{cmd_str} >> \"{log_path}\" 2>&1",
+                ]
+                launch_cmd_path.write_text("\r\n".join(bat_lines) + "\r\n", encoding="utf-8")
+                ps_expr = (
+                    f"$r = Invoke-CimMethod -ClassName Win32_Process -MethodName Create "
+                    f"-Arguments @{{CommandLine='{launch_cmd_path}'}}; "
+                    f"if ($r.ReturnValue -eq 0 -and $r.ProcessId) {{ Write-Output $r.ProcessId }} else {{ exit 1 }}"
+                )
+                wmi_res = subprocess.run(
+                    ["powershell", "-NoProfile", "-Command", ps_expr],
+                    capture_output=True,
+                    text=True,
+                    timeout=5.0,
+                )
+                if wmi_res.returncode == 0 and wmi_res.stdout.strip().splitlines():
+                    spawned_pid = int(wmi_res.stdout.strip().splitlines()[-1].strip())
+            except Exception:
+                spawned_pid = None
+
+        if spawned_pid is None:
+            log_fh = open(log_path, "a", encoding="utf-8")
+            popen_kwargs: dict[str, Any] = {
+                "stdin": subprocess.DEVNULL,
+                "stdout": log_fh,
+                "stderr": subprocess.STDOUT,
+                "env": child_env,
+            }
+            if os.name == "nt":
+                popen_kwargs["creationflags"] = (
+                    getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+                    | getattr(subprocess, "DETACHED_PROCESS", 0)
+                )
+            else:
+                popen_kwargs["start_new_session"] = True
+
+            proc = subprocess.Popen(child_cmd, **popen_kwargs)
+            log_fh.close()
+            spawned_pid = proc.pid
+
+        deadline = time.time() + 8.0
+        ready = False
+        while time.time() < deadline:
+            try:
+                health = _http_json(f"{target_ctrl_url}/api/v1/health", timeout=0.5)
+                if health.get("status") == "ok":
+                    ready = True
+                    break
+            except Exception:
+                time.sleep(0.1)
+
+        if not ready:
+            raise RuntimeError(f"Controller daemon (PID {spawned_pid}) failed to become healthy at {target_ctrl_url}")
+
+        pid_path.parent.mkdir(parents=True, exist_ok=True)
+        pid_path.write_text(
+            json.dumps(
+                {
+                    "pid": spawned_pid,
+                    "controller_url": target_ctrl_url,
+                    "state_path": str(state_path),
+                    "log_path": str(log_path),
+                    "started_at": time.time(),
+                },
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        status_info = _http_json(f"{target_ctrl_url}/api/v1/cluster/status", timeout=2.0)
+        tokens = status_info.get("tokens", [])
+        boot_tok = tokens[0].get("secret_token", "") if tokens else (cfg.get("bootstrap_join_token") or "")
+        print("=" * 96)
+        print(f" QKD-SDWAN Central Controller Daemon Running in Background (PID: {spawned_pid})")
+        print(f" Local Controller URL : {target_ctrl_url}")
+        print(f" State File           : {state_path}")
+        print(f" Bootstrap Join Token : {boot_tok}")
+        print("=" * 96)
+        return 0
+
     server = SDWANControllerServer(
         host=str(cfg["host"]),
-        port=int(cfg["port"]),
+        port=port_num,
         overlay_subnet_prefix=str(cfg.get("overlay_subnet_prefix", "10.200.0.")),
         cluster_hmac_secret_hex=cfg.get("cluster_hmac_secret_hex"),
         bootstrap_join_token=cfg.get("bootstrap_join_token"),
+        state_path=state_path,
     )
     bound_host, bound_port = server.start_background()
     display_host = "127.0.0.1" if bound_host == "0.0.0.0" else bound_host
@@ -378,6 +635,24 @@ def _run_serve(args: argparse.Namespace) -> int:
         pass
     lan_url = f"http://{lan_ip}:{bound_port}"
 
+    try:
+        pid_path.parent.mkdir(parents=True, exist_ok=True)
+        pid_path.write_text(
+            json.dumps(
+                {
+                    "pid": os.getpid(),
+                    "controller_url": ctrl_url,
+                    "state_path": str(state_path),
+                    "started_at": time.time(),
+                },
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+    except Exception:
+        pass
+
     print("=" * 96)
     print(f" QKD-SDWAN Central Controller started on http://{bound_host}:{bound_port}")
     print(f" Local Controller URL : {ctrl_url}")
@@ -390,7 +665,7 @@ def _run_serve(args: argparse.Namespace) -> int:
     print("=" * 96)
     try:
         if getattr(args, "dashboard", False):
-            while True:
+            while not server.stop_event.is_set():
                 print("\n" + render_controller_dashboard(server.get_cluster_status(), controller_url=ctrl_url))
                 print("Dashboard Actions: [r] Refresh  [t] Create Join Token  [x] Revoke Token  [q] Stop Server & Quit")
                 try:
@@ -411,12 +686,79 @@ def _run_serve(args: argparse.Namespace) -> int:
                     else:
                         print(f"  [!] Token not found: {tid}")
         else:
-            while True:
-                time.sleep(1.0)
+            while not server.stop_event.is_set():
+                server.stop_event.wait(timeout=0.5)
     except KeyboardInterrupt:
         pass
     finally:
         server.shutdown()
+        try:
+            if pid_path.exists():
+                pid_path.unlink()
+        except Exception:
+            pass
+    return 0
+
+
+def _run_stop(args: argparse.Namespace) -> int:
+    cfg = _load_controller_config(args)
+    port_num = int(cfg.get("port", 8080))
+    _state_path, pid_path = _resolve_controller_paths(args, port_num)
+    url = _resolve_controller_url(args).rstrip("/")
+    pid_val: int | None = None
+    if pid_path.exists():
+        try:
+            pid_data = json.loads(pid_path.read_text(encoding="utf-8"))
+            pid_val = int(pid_data["pid"]) if pid_data.get("pid") else None
+            if not getattr(args, "controller_url", None) and pid_data.get("controller_url"):
+                url = str(pid_data["controller_url"]).rstrip("/")
+        except Exception:
+            pass
+
+    stopped_via_api = False
+    try:
+        _http_json(f"{url}/api/v1/admin/shutdown", method="POST", payload={}, timeout=2.0)
+        stopped_via_api = True
+    except Exception:
+        pass
+
+    if pid_val is not None:
+        deadline = time.time() + 2.5
+        while time.time() < deadline:
+            if os.name == "nt":
+                try:
+                    _http_json(f"{url}/api/v1/health", timeout=0.25)
+                    time.sleep(0.05)
+                except Exception:
+                    break
+            else:
+                try:
+                    os.kill(pid_val, 0)
+                    time.sleep(0.05)
+                except Exception:
+                    break
+        else:
+            try:
+                os.kill(pid_val, signal.SIGTERM)
+            except Exception:
+                pass
+    try:
+        if pid_path.exists():
+            pid_path.unlink()
+    except Exception:
+        pass
+
+    print(
+        json.dumps(
+            {
+                "status": "stopped",
+                "controller_url": url,
+                "pid": pid_val,
+                "stopped_via_api": stopped_via_api,
+            },
+            indent=2,
+        )
+    )
     return 0
 
 
@@ -500,8 +842,13 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     sub = getattr(args, "subcommand", None)
 
+    if sub == "up":
+        setattr(args, "daemon", True)
+        return _run_serve(args)
     if sub in (None, "serve"):
         return _run_serve(args)
+    if sub in ("stop", "down"):
+        return _run_stop(args)
     if sub == "init-config":
         return _run_init_config(args)
     if sub == "dashboard":

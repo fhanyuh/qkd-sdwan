@@ -18,8 +18,10 @@ dependencies = [
 [project.scripts]
 qkd-sdwan-controller = "qkd_sdwan.controller.cli:main"
 qkd-sdwan-ctl = "qkd_sdwan.controller.cli:main"
+qkd-ctl = "qkd_sdwan.controller.cli:main"
 qkd-sdwan-client = "qkd_sdwan.client.agent:main"
 qkd-sdwan-agent = "qkd_sdwan.client.agent:main"
-
+qkd-sdwan = "qkd_sdwan.client.agent:main"
+qkd = "qkd_sdwan.client.agent:main"
 [tool.setuptools.packages.find]
 include = ["qkd_sdwan*"]

@@ -127,9 +127,13 @@ class WireGuardTunnelDaemon:
         try:
             if os.name != "nt":
                 self._udp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            sock_bind_host = "127.0.0.1" if self.bind_host in ("127.0.0.1", "localhost", "::1") else "0.0.0.0"
-            self._udp_sock.bind((sock_bind_host, self.listen_port))
-            if hasattr(socket, "SIO_UDP_CONNRESET"):
+            try:
+                self._udp_sock.bind(("0.0.0.0", self.listen_port))
+            except OSError:
+                if self.listen_port != 0:
+                    self._udp_sock.bind(("0.0.0.0", 0))
+                else:
+                    raise
                 try:
                     self._udp_sock.ioctl(socket.SIO_UDP_CONNRESET, False)
                 except OSError:
@@ -205,12 +209,23 @@ class WireGuardTunnelDaemon:
     ) -> PeerTunnelState:
         """Register or update a peer in the WireGuard tunnel table."""
         with self._lock:
-            self._direct_endpoints[peer_node] = underlay_endpoint
+            existing_ep = self._direct_endpoints.get(peer_node)
+            preserve_roamed = False
+            if existing_ep and existing_ep != underlay_endpoint:
+                try:
+                    ex_h, ex_p = self._parse_endpoint(existing_ep)
+                    _new_h, new_p = self._parse_endpoint(underlay_endpoint)
+                    if ex_p > 0 and ex_p != new_p and ex_h not in ("127.0.0.1", "::1", "0.0.0.0"):
+                        preserve_roamed = True
+                except Exception:
+                    pass
+            if not preserve_roamed:
+                self._direct_endpoints[peer_node] = underlay_endpoint
             if peer_node in self._peers:
                 state = self._peers[peer_node]
                 state.peer_public_key = peer_public_key
                 state.peer_overlay_ip = peer_overlay_ip
-                if state.route_mode == RouteMode.DIRECT_P2P:
+                if state.route_mode == RouteMode.DIRECT_P2P and not preserve_roamed:
                     state.underlay_endpoint = underlay_endpoint
                 return state
 
@@ -326,25 +341,36 @@ class WireGuardTunnelDaemon:
         payload: bytes,
         timeout: float = 2.0,
         max_retries: int = 3,
+        allow_quarantined_probe: bool = False,
+        relay_endpoint_override: str | None = None,
+        relay_node_override: str | None = None,
     ) -> dict[str, Any]:
         """Encrypt and transmit an overlay data-plane packet over UDP (direct or P2P relay) with auto-retry."""
         with self._lock:
             state = self._peers.get(target_node)
             if state is None:
                 raise KeyError(f"Unknown WireGuard peer: {target_node}")
-            if state.route_mode == RouteMode.QUARANTINED:
+            if state.route_mode == RouteMode.QUARANTINED and not allow_quarantined_probe:
                 raise PermissionError(f"Link {self.node_id} -> {target_node} is QUARANTINED due to security policy")
             aead_key = self._session_aead_keys.get(target_node)
             if aead_key is None:
                 raise PermissionError(f"No active WireGuard AEAD session key for peer {target_node}")
 
-            route_mode = state.route_mode
-            via_relay = state.via_relay_node
-            next_hop_ep = state.underlay_endpoint
+            if relay_endpoint_override and relay_node_override:
+                route_mode = RouteMode.RELAY_P2P
+                via_relay = relay_node_override
+                next_hop_ep = relay_endpoint_override
+            elif state.route_mode == RouteMode.QUARANTINED:
+                route_mode = RouteMode.DIRECT_P2P
+                via_relay = None
+                next_hop_ep = self._direct_endpoints.get(target_node, state.underlay_endpoint)
+            else:
+                route_mode = state.route_mode
+                via_relay = state.via_relay_node
+                next_hop_ep = state.underlay_endpoint
             direct_ep = self._direct_endpoints.get(target_node, state.underlay_endpoint)
             psk_epoch = state.psk_epoch
             psk_fingerprint = state.current_psk_fingerprint
-
         packet_id = secrets.token_hex(8)
         nonce = secrets.token_bytes(12)
         aad_obj = {
@@ -397,6 +423,22 @@ class WireGuardTunnelDaemon:
 
             rtt_ms = (time.perf_counter() - start_ts) * 1000.0
             if ack_holder.get("type") == "WG_AUTH_FAIL":
+                if allow_quarantined_probe:
+                    return {
+                        "status": "AUTH_PROBE_REPLY",
+                        "delivered": False,
+                        "reachable": True,
+                        "packet_id": packet_id,
+                        "source_node": self.node_id,
+                        "target_node": target_node,
+                        "route_mode": route_mode.value,
+                        "via_relay_node": ack_holder.get("relayed_by") or via_relay,
+                        "psk_epoch": psk_epoch,
+                        "psk_fingerprint": psk_fingerprint,
+                        "rtt_ms": rtt_ms,
+                        "payload_bytes": len(payload),
+                        "wire_bytes": len(raw_datagram),
+                    }
                 raise PermissionError(
                     f"WireGuard AEAD decryption failed at {target_node}: {ack_holder.get('reason', 'PSK_MISMATCH')}"
                 )
@@ -413,10 +455,194 @@ class WireGuardTunnelDaemon:
                 "psk_fingerprint": psk_fingerprint,
                 "rtt_ms": rtt_ms,
                 "payload_bytes": len(payload),
+                "wire_bytes": len(raw_datagram),
             }
         finally:
             with self._lock:
                 self._pending_acks.pop(packet_id, None)
+
+    def _send_unkeyed_ping_probe(self, target_node: str, timeout: float = 0.6) -> tuple[float, int]:
+        """Send a lightweight UDP WG_PING probe to target_node and wait for WG_ACK when AEAD session is unavailable."""
+        with self._lock:
+            state = self._peers.get(target_node)
+            if state is None:
+                raise KeyError(f"Unknown WireGuard peer: {target_node}")
+            ep = self._direct_endpoints.get(target_node) or state.underlay_endpoint
+        if not ep or ep.endswith(":0"):
+            raise TimeoutError(f"No valid endpoint for peer {target_node}")
+        dest_host, dest_port = self._parse_endpoint(ep)
+        if dest_port <= 0:
+            raise TimeoutError(f"Invalid port for peer {target_node}: {ep}")
+
+        packet_id = secrets.token_hex(8)
+        ping_pkt = json.dumps(
+            {
+                "type": "WG_PING",
+                "packet_id": packet_id,
+                "source_node": self.node_id,
+                "target_node": target_node,
+                "timestamp": time.time(),
+            },
+            separators=(",", ":"),
+        ).encode("utf-8")
+
+        ack_event = threading.Event()
+        ack_holder: dict[str, Any] = {}
+        with self._lock:
+            self._pending_acks[packet_id] = (ack_event, ack_holder)
+        start_ts = time.perf_counter()
+        try:
+            with self._send_lock:
+                self._udp_sock.sendto(ping_pkt, (dest_host, dest_port))
+            with self._lock:
+                if target_node in self._peers:
+                    self._peers[target_node].tx_bytes += len(ping_pkt)
+            if not ack_event.wait(timeout=max(0.1, float(timeout))):
+                raise TimeoutError(f"UDP WG_PING to {target_node} timed out after {timeout}s")
+            rtt_ms = (time.perf_counter() - start_ts) * 1000.0
+            return rtt_ms, len(ping_pkt) + 128
+        finally:
+            with self._lock:
+                self._pending_acks.pop(packet_id, None)
+
+    def probe_peer_link(
+        self,
+        target_node: str,
+        count: int = 3,
+        timeout: float = 0.6,
+        probe_payload: bytes = b"QKD-SDWAN-P2P-PROBE",
+    ) -> dict[str, Any]:
+        """Measure real peer link RTT, jitter, packet loss, and wire throughput via multi-packet UDP probes."""
+        sent = max(1, int(count))
+        rtts: list[float] = []
+        total_wire_bytes = 0
+        last_delivery: dict[str, Any] | None = None
+
+        with self._lock:
+            relay_fallbacks: list[tuple[str, str]] = [
+                (pid, self._direct_endpoints.get(pid, pstate.underlay_endpoint))
+                for pid, pstate in self._peers.items()
+                if pid != target_node and pstate.route_mode != RouteMode.QUARANTINED
+            ]
+
+        for _ in range(sent):
+            probed_ok = False
+            try:
+                res = self.send_overlay_packet(
+                    target_node=target_node,
+                    payload=probe_payload,
+                    timeout=timeout,
+                    max_retries=1,
+                    allow_quarantined_probe=True,
+                )
+                rtt = float(res["rtt_ms"])
+                rtts.append(rtt)
+                total_wire_bytes += int(res.get("wire_bytes", len(probe_payload) + 256)) + 160
+                last_delivery = res
+                probed_ok = True
+            except PermissionError:
+                try:
+                    rtt, wbytes = self._send_unkeyed_ping_probe(target_node, timeout=timeout)
+                    rtts.append(rtt)
+                    total_wire_bytes += wbytes
+                    probed_ok = True
+                except Exception:
+                    pass
+            except Exception:
+                pass
+
+            if not probed_ok and relay_fallbacks:
+                for rel_node, rel_ep in relay_fallbacks:
+                    if not rel_ep or rel_ep.endswith(":0"):
+                        continue
+                    try:
+                        res = self.send_overlay_packet(
+                            target_node=target_node,
+                            payload=probe_payload,
+                            timeout=timeout,
+                            max_retries=1,
+                            allow_quarantined_probe=True,
+                            relay_endpoint_override=rel_ep,
+                            relay_node_override=rel_node,
+                        )
+                        rtt = float(res["rtt_ms"])
+                        rtts.append(rtt)
+                        total_wire_bytes += int(res.get("wire_bytes", len(probe_payload) + 256)) + 160
+                        last_delivery = res
+                        break
+                    except Exception:
+                        continue
+
+        received = len(rtts)
+        packet_loss_pct = round(((sent - received) / float(sent)) * 100.0, 2)
+        if received == 0:
+            return {
+                "reachable": False,
+                "latency_ms": 0.0,
+                "jitter_ms": 0.0,
+                "packet_loss_pct": 100.0,
+                "throughput_mbps": 0.0,
+                "probes_sent": sent,
+                "probes_received": 0,
+                "last_delivery": None,
+            }
+
+        latency_ms = round(sum(rtts) / float(received), 3)
+        if received > 1:
+            jitter_ms = round(
+                sum(abs(rtts[i] - rtts[i - 1]) for i in range(1, received)) / float(received - 1),
+                3,
+            )
+        else:
+            jitter_ms = 0.0
+
+        total_wire_bits = float(total_wire_bytes) * 8.0
+        total_sec = sum(rtts) / 1000.0
+        throughput_mbps = round((total_wire_bits / max(1e-6, total_sec)) / 1e6, 3)
+        return {
+            "reachable": True,
+            "latency_ms": latency_ms,
+            "jitter_ms": jitter_ms,
+            "packet_loss_pct": packet_loss_pct,
+            "throughput_mbps": throughput_mbps,
+            "probes_sent": sent,
+            "probes_received": received,
+            "last_delivery": last_delivery,
+        }
+    def send_keepalive(self, peer_node: str | None = None) -> int:
+        """Send lightweight UDP keepalive datagrams to registered peers to maintain NAT port mappings."""
+        with self._lock:
+            targets: list[tuple[str, str]] = []
+            for pid, state in self._peers.items():
+                if peer_node is not None and pid != peer_node:
+                    continue
+                if state.route_mode == RouteMode.QUARANTINED:
+                    continue
+                ep = state.underlay_endpoint or self._direct_endpoints.get(pid)
+                if ep and not ep.endswith(":0"):
+                    targets.append((pid, ep))
+
+        sent_count = 0
+        for _pid, ep in targets:
+            try:
+                dest_host, dest_port = self._parse_endpoint(ep)
+                if dest_port <= 0:
+                    continue
+                pkt = json.dumps(
+                    {
+                        "type": "WG_KEEPALIVE",
+                        "source_node": self.node_id,
+                        "timestamp": time.time(),
+                    },
+                    separators=(",", ":"),
+                ).encode("utf-8")
+                with self._send_lock:
+                    self._udp_sock.sendto(pkt, (dest_host, dest_port))
+                sent_count += 1
+            except Exception:
+                pass
+        return sent_count
+
     def _udp_receive_loop(self) -> None:
         while not self._stop_event.is_set():
             try:
@@ -436,13 +662,46 @@ class WireGuardTunnelDaemon:
                 self._handle_ack_or_fail(msg, datagram)
             elif msg_type == "WG_DATA":
                 self._handle_data_packet(msg, datagram, sender_addr)
+            elif msg_type == "WG_PING":
+                src_id = str(msg.get("source_node", "")).strip()
+                pkt_id = str(msg.get("packet_id", "")).strip()
+                if src_id and sender_addr[0] not in ("127.0.0.1", "::1", "0.0.0.0"):
+                    live_ep = f"{sender_addr[0]}:{sender_addr[1]}"
+                    with self._lock:
+                        self._direct_endpoints[src_id] = live_ep
+                        if src_id in self._peers and self._peers[src_id].route_mode == RouteMode.DIRECT_P2P:
+                            self._peers[src_id].underlay_endpoint = live_ep
+                ack_pkt = json.dumps(
+                    {
+                        "type": "WG_ACK",
+                        "packet_id": pkt_id,
+                        "source_node": src_id,
+                        "responder_node": self.node_id,
+                        "timestamp": time.time(),
+                    },
+                    separators=(",", ":"),
+                ).encode("utf-8")
+                with self._send_lock:
+                    self._udp_sock.sendto(ack_pkt, sender_addr)
+                continue
+            elif msg_type == "WG_KEEPALIVE":
+                src_id = str(msg.get("source_node", "")).strip()
+                if src_id and sender_addr[0] not in ("127.0.0.1", "::1", "0.0.0.0"):
+                    live_ep = f"{sender_addr[0]}:{sender_addr[1]}"
+                    with self._lock:
+                        self._direct_endpoints[src_id] = live_ep
+                        if src_id in self._peers and self._peers[src_id].route_mode == RouteMode.DIRECT_P2P:
+                            self._peers[src_id].underlay_endpoint = live_ep
+                continue
 
     def _handle_ack_or_fail(self, msg: dict[str, Any], raw_datagram: bytes) -> None:
         target_origin = msg.get("source_node")
         if target_origin and target_origin != self.node_id:
-            origin_ep = msg.get("origin_endpoint")
+            with self._lock:
+                learned_ep = self._direct_endpoints.get(str(target_origin))
+            origin_ep = msg.get("relay_return_endpoint") or learned_ep or msg.get("origin_endpoint")
             if origin_ep:
-                host, port = self._parse_endpoint(origin_ep)
+                host, port = self._parse_endpoint(str(origin_ep))
                 with self._send_lock:
                     self._udp_sock.sendto(raw_datagram, (host, port))
             return
@@ -537,7 +796,11 @@ class WireGuardTunnelDaemon:
 
         reply_ep = msg.get("origin_endpoint")
         reply_addr = self._parse_endpoint(str(reply_ep)) if reply_ep else sender_addr
-        if reply_addr[0] == "127.0.0.1" and sender_addr[0] not in ("127.0.0.1", "::1"):
+        if msg.get("relayed_by"):
+            reply_addr = sender_addr
+        elif reply_addr[1] <= 0:
+            reply_addr = sender_addr
+        elif reply_addr[0] == "127.0.0.1" and sender_addr[0] not in ("127.0.0.1", "::1"):
             reply_addr = (sender_addr[0], reply_addr[1])
         if aead_key is None:
             with self._lock:
@@ -548,6 +811,8 @@ class WireGuardTunnelDaemon:
                 "source_node": source_node,
                 "responder_node": self.node_id,
                 "origin_endpoint": msg.get("origin_endpoint"),
+                "relay_return_endpoint": msg.get("relay_return_endpoint"),
+                "relayed_by": msg.get("relayed_by"),
                 "reason": "UNKNOWN_PEER_SESSION",
             }
             with self._send_lock:
@@ -566,12 +831,29 @@ class WireGuardTunnelDaemon:
                 "source_node": source_node,
                 "responder_node": self.node_id,
                 "origin_endpoint": msg.get("origin_endpoint"),
+                "relay_return_endpoint": msg.get("relay_return_endpoint"),
+                "relayed_by": msg.get("relayed_by"),
                 "reason": "PSK_AEAD_TAG_MISMATCH",
             }
             with self._send_lock:
                 self._udp_sock.sendto(json.dumps(fail_pkt).encode("utf-8"), reply_addr)
             return
 
+
+        if not msg.get("relayed_by"):
+            live_endpoint = f"{sender_addr[0]}:{sender_addr[1]}"
+            if sender_addr[0] not in ("127.0.0.1", "::1", "0.0.0.0"):
+                with self._lock:
+                    self._direct_endpoints[source_node] = live_endpoint
+                    if source_node in self._peers and self._peers[source_node].route_mode == RouteMode.DIRECT_P2P:
+                        self._peers[source_node].underlay_endpoint = live_endpoint
+                reply_addr = sender_addr
+            else:
+                with self._lock:
+                    if source_node in self._peers and self._peers[source_node].underlay_endpoint.endswith(":0"):
+                        self._direct_endpoints[source_node] = live_endpoint
+                        if self._peers[source_node].route_mode == RouteMode.DIRECT_P2P:
+                            self._peers[source_node].underlay_endpoint = live_endpoint
         is_duplicate = False
         with self._lock:
             if packet_id and packet_id in self._seen_packet_set:
@@ -592,6 +874,7 @@ class WireGuardTunnelDaemon:
             "source_node": source_node,
             "responder_node": self.node_id,
             "origin_endpoint": msg.get("origin_endpoint"),
+            "relay_return_endpoint": msg.get("relay_return_endpoint"),
             "relayed_by": msg.get("relayed_by"),
             "timestamp": time.time(),
         }
